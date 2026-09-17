@@ -70,6 +70,38 @@ A fourth round closed two more, and made a deliberate call on a third:
     decryption" below for the reasoning, and `SSLKEYLOGFILE` support as
     the safer alternative that was offered instead (not yet built).
 
+A fifth round closed the rest of the protocol list, and — separately —
+found two real, previously-undetected bugs that had nothing to do with
+the new protocols at all:
+
+13. **RDP, TFTP, SNMP, and DNP3 parsing.** Rules can now match
+    `rdp.cookie`, `tftp.opcode`, `tftp.filename`, `snmp.community`, and
+    `dnp3.function`. RDP's cookie — an explicit, often attacker-supplied
+    username hint sent in RDP's very first, always-cleartext packet — is
+    arguably the single highest-value addition of this round, given how
+    common RDP brute-forcing is as a ransomware entry point. Telnet was
+    considered and deliberately left out: unlike FTP/SMTP, it has no
+    clean protocol-level command structure to reliably extract
+    credentials from (it's an interactive character stream, not
+    discrete commands), and a low-confidence parser isn't worth having.
+    See "Four more protocols" below for what's actually covered.
+14. **A real, previously-undetected bug in the rule engine itself.**
+    Every UDP-based detection path — raw payload matching, DNS query
+    matching, and now TFTP/SNMP — calls the rule engine with
+    `Direction::Any`, and `Direction::Any` was never a valid lookup key:
+    a rule declared `direction: any` gets *expanded* into separate
+    `ToServer`/`ToClient` entries at load time, so a query keyed
+    literally on `Any` matched nothing, for *any* rule, regardless of
+    how it was declared. This had been silently breaking DNS/UDP rule
+    matching since it was first added, several rounds ago — it just
+    never got caught, because nothing had live-tested a matching UDP
+    rule until this round. See "Two real bugs" below.
+15. **A second bug, in alert suppression.** Two genuinely different
+    `SIGNATURE_MATCH` alerts (different rules entirely) sharing the same
+    source, destination, and protocol were being treated as duplicates
+    of each other, since nothing in the suppression key distinguished
+    *which rule* matched. Also covered in "Two real bugs" below.
+
 It is still not Suricata. See "What's still not here" at the end for an
 honest accounting of what a genuinely complete IDS also needs that this
 doesn't attempt.
@@ -498,6 +530,151 @@ file and threading key material through decryption isn't the same shape
 of work as anything else here), but a reasonable next step if that
 visibility is actually the goal.
 
+## Four more protocols: RDP, TFTP, SNMP, and DNP3
+
+**RDP** — content-sniffed via its TPKT (RFC 1006) + X.224 Connection
+Request framing, checked once per direction (the one-shot pattern
+HTTP/TLS/SSH already use, since this only ever appears as the very
+first message of a connection — despite the framing looking
+superficially similar to SMB2's length-prefixed messages, RDP doesn't
+need a new incremental cursor). Extracts the optional `Cookie:
+mstshash=<value>` routing token — an explicit, often attacker-supplied
+username hint many RDP clients (and, notably, many brute-force tools)
+send. This is visible even for NLA/CredSSP-secured sessions: the
+negotiation to switch to TLS happens *after* this exchange, not before,
+so the cookie is never hidden behind encryption regardless of how the
+rest of the connection gets secured. `rdp.cookie` is always present as a
+buffer (empty string, not absent, when no cookie was sent) rather than
+only sometimes existing, specifically so a `not_literal` rule against it
+stays meaningful. Not parsed: the RDP Negotiation Request structure that
+can follow the cookie (which security protocols the client's offering)
+— the cookie is the higher-value field, and negotiation-flag parsing
+isn't free of its own edge cases worth getting right separately.
+
+**TFTP** — parsed directly per-packet (UDP has no stream to reassemble,
+so this works the same way DNS query parsing already does), gated to
+port 69 rather than content-sniffed: its 2-byte opcode field is as weak
+a signal as Modbus's protocol-ID field, common enough to appear in
+arbitrary UDP payloads by chance. Extracts the opcode name
+(`tftp.opcode`) and, for read/write requests specifically, the requested
+filename (`tftp.filename`) — TFTP's simplicity is exactly what's kept it
+a longstanding, still-common vector for pulling malware or config
+payloads onto IoT and embedded devices, and the filename is most of the
+useful signal here.
+
+**SNMP** — also parsed per-packet, also port-gated (161/162), for the
+same reason as TFTP, even though the structural check here (a specific
+BER SEQUENCE{INTEGER version, OCTET STRING community}) is a meaningfully
+stronger signal than either Modbus's or TFTP's — kept consistent with
+the rest of the port-gated group rather than making a one-off exception
+based on a judgment call about exactly how strong a signature has to be.
+This needed a small, narrowly-scoped BER/ASN.1 reader (`read_ber_tlv`)
+— not a general one: it recognizes exactly the SEQUENCE/INTEGER/
+OCTET-STRING tags needed to walk an SNMPv1/v2c message's fixed header
+shape, handles both short- and multi-byte long-form BER lengths (needed
+for community strings over 127 bytes), and returns `None` on anything
+else — SNMPv3's structurally different message (no plaintext community
+string to find) included — rather than guessing. `snmp.community`
+catches the classic default-credential scanning pattern (`public`/
+`private`) that's remained relevant for this protocol for decades.
+
+**DNP3** — the natural next industrial protocol after Modbus, common in
+North American electric-utility SCADA/RTU communication. Gated to port
+20000 like Modbus/TFTP/SNMP, even though its 2-byte sync pattern
+(`0x05 0x64`) is a meaningfully *stronger* signal than any of those
+three (two specific non-zero bytes, not a common padding/reserved-field
+artifact the way Modbus's all-zero protocol-ID field is) — still nowhere
+near SMB2's 4-byte ASCII magic, so this stays grouped with the
+port-gated protocols rather than being content-sniffed on a judgment
+call about where exactly the line sits. The real complexity here is
+DNP3's data-link layer, which interleaves a CRC-16 after every 16 bytes
+of payload — bytes that have to be stripped back out before the
+transport and application layers underneath become readable as
+contiguous data. CRC *validation* is deliberately not implemented:
+corrupted frames just fail to parse further rather than being flagged
+as corrupt specifically, since DNP3's particular CRC-16 variant doesn't
+add IDS value here, only implementation risk for a check this parser
+doesn't otherwise need. `dnp3.function` extracts the application-layer
+function code from a scoped subset of IEEE 1815's ~30 codes — the ones
+with real physical-device-control or session-disruption implications
+(`OPERATE` and `DIRECT_OPERATE` chief among them), the same reasoning
+that made Modbus's write-type codes the highest-value field there.
+
+All four were verified against genuine, real captured traffic during
+development, the same way SMB2/Modbus were — a Python script opened
+real TCP connections (or, for TFTP/SNMP, sent real UDP datagrams) and
+sent byte-for-byte spec-accurate messages, captured live through the
+actual `pcap` pipeline, all four correctly producing a `SIGNATURE_MATCH`
+alert. That verification step is what actually caught the two bugs
+below — neither would have been found by code review or by the existing
+unit tests alone.
+
+## Two real bugs this round, neither about the new protocols
+
+Both were caught by the exact same thing that's caught every real bug
+this session: testing against genuine captured traffic instead of
+trusting that code compiling and unit tests passing meant it worked.
+
+**Bug one: `Direction::Any` was never a valid lookup key.** Every
+UDP-based detection path in `main.rs` — raw payload matching, DNS query
+matching, and the new TFTP/SNMP matching — calls
+`SignatureEngine::check_buffer` with `Direction::Any`, because none of
+them go through `FlowTable` (the only thing that ever computes a real
+to-server/to-client direction) — they're all per-packet, with nothing
+tracking which side of a connection is which. But `RuleSet::load`
+expands a rule declared `direction: any` into separate `(buffer,
+ToServer)` and `(buffer, ToClient)` map entries at load time; nothing is
+ever stored under the key `(buffer, Direction::Any)` itself. A lookup
+literally keyed on `Any` therefore matched *nothing*, for *any* rule,
+regardless of how that rule was declared — not just rules declared
+`any`, every single UDP-based signature rule was silently broken. This
+had been true since DNS query rule matching was first added, several
+rounds ago; it went undetected because every TCP-based protocol
+computes a real direction via `FlowTable` before ever calling this, so
+nothing exercised the `Any`-as-a-lookup-key path — and because nobody
+had live-tested an actual matching UDP rule until this round's TFTP/SNMP
+verification did.
+
+The fix: `RuleSet::check` now treats `Direction::Any` as "the caller
+doesn't track direction for this traffic," checking both stored
+directions and merging the (de-duplicated — an `any`-declared rule is
+physically stored twice, and would otherwise be reported twice for one
+`Any` query) results, rather than passing `Any` straight through as a
+single lookup key. `querying_with_direction_any_finds_rules_of_every_
+declared_direction` tests all three declaration forms against an `Any`
+query directly — the actual shape of the bug — and
+`any_declared_rule_is_not_reported_twice_by_an_any_query` covers the
+de-duplication.
+
+**Bug two: `SIGNATURE_MATCH` alerts weren't suppression-keyed by rule
+identity.** Found immediately after fixing the first bug, while
+re-verifying TFTP and SNMP together: two genuinely different rules (a
+TFTP filename match and an unrelated SNMP community-string match) fired
+from the same source, destination, and protocol close together, and the
+second was silently swallowed as a "duplicate" of the first — the
+suppression key (`category|src|dst|proto`, already fixed twice this
+project for missing `proto` and missing `dst`) still had no way to tell
+that these were two unrelated pieces of evidence, not a repeat of the
+same one. The fix adds `message` to the key, but **only for
+`SIGNATURE_MATCH`**: that category's message is deterministic per rule
+(built from just the buffer name and rule name, nothing that changes
+between repeated matches), unlike `PORT_SCAN`'s growing port count or
+`PACKET_FLOOD`'s growing packet count — including `message` for *those*
+categories would make every new count produce a different key and
+defeat suppression entirely, the opposite of what's needed.
+
+This matters more for UDP-based signatures specifically than TCP ones:
+only TCP flows get `FlowTable`'s own separate per-flow, per-rule dedup
+(the `matched: FxHashSet<String>` on each `StreamHalf`); UDP detection
+is per-packet with no flow state at all, so `run_alert_writer`'s
+suppression key is the *only* thing standing between a repeatedly-
+matching UDP signature and alert spam — making it more important to get
+right here, not less.
+`different_signature_matches_are_not_mutually_suppressed` and
+`repeated_matches_of_the_same_signature_still_suppress_normally` cover
+both halves: two different rules must both survive, and the same rule
+firing repeatedly must still collapse to one alert.
+
 ## Architecture
 
 ```
@@ -521,24 +698,29 @@ capture thread --parse--> shard(host pair) --> worker[0..N) --> alert channel --
   alerting (`Alert`, `PcapDumpRequest`, text or JSON output, the writer
   thread); the rule engine (`Buffer`, `Direction`, `RuleSet` —
   literal/regex/negation matching, grouped by buffer+direction at load
-  time); the HTTP/DNS/TLS/FTP/SSH/SMTP/SMB2/Modbus protocol parsers
-  (bounds-checked against arbitrary input, no decryption anywhere);
-  `SignatureEngine` (IP blacklist + the rule engine); `AnomalyEngine`
-  (packet-rate flood, TCP-SYN port-scan, and reply-aware, time-gated-
-  pruning UDP port-scan detection); and `FlowTable` (TCP stream
-  reassembly, with a configurable byte cap — in-order append, bounded
-  out-of-order buffering, retransmit/overlap handling, and the
-  HTTP/TLS/FTP/SSH/SMTP/SMB2/Modbus parsing + rule-checking hooks that
-  run against the growing reassembled buffer, via three different kinds
-  of incremental cursor: one-shot for HTTP/TLS/SSH, CRLF-line-based for
-  FTP/SMTP, length-prefixed-binary-framing-based for SMB2/Modbus).
+  time, `Direction::Any` queries checking both stored directions);
+  the HTTP/DNS/TLS/FTP/SSH/SMTP/SMB2/Modbus/RDP/TFTP/SNMP/DNP3 protocol
+  parsers (bounds-checked against arbitrary input, no decryption
+  anywhere); `SignatureEngine` (IP blacklist + the rule engine);
+  `AnomalyEngine` (packet-rate flood, TCP-SYN port-scan, and
+  reply-aware, time-gated-pruning UDP port-scan detection); and
+  `FlowTable` (TCP stream reassembly, with a configurable byte cap —
+  in-order append, bounded out-of-order buffering, retransmit/overlap
+  handling, and the TCP-based protocols' parsing + rule-checking hooks
+  that run against the growing reassembled buffer, via three different
+  kinds of incremental cursor: one-shot for HTTP/TLS/SSH/RDP,
+  CRLF-line-based for FTP/SMTP, length-prefixed-binary-framing-based for
+  SMB2/Modbus/DNP3 — TFTP/SNMP are UDP, so they're parsed per-packet in
+  `main.rs` directly, the same way DNS already was, never touching
+  `FlowTable` at all).
 - **`src/main.rs`** — CLI, the `pcap` capture loop, host-pair worker
   sharding (uniform across every protocol), worker-pool wiring, the
-  packet-retention ring buffer (`PcapRing`), and pcap-file writing split
+  packet-retention ring buffer (`PcapRing`), pcap-file writing split
   across two threads (`open_pcap_dump` on the capture thread, since it
   needs the live `pcap::Capture` handle; `write_frames_to_savefile` on a
   dedicated writer thread, since it's the slow, disk-bound part and must
-  never stall packet capture).
+  never stall packet capture), and the UDP-based protocols' per-packet
+  parsing (DNS, TFTP, SNMP, raw payload).
 
 ## The rule file format
 
@@ -546,7 +728,7 @@ One rule per line: `name|buffer|direction|type|pattern`
 
 | Field | Values |
 |---|---|
-| `buffer` | `payload` \| `http.uri` \| `http.host` \| `dns.query` \| `tls.sni` \| `tls.ja3` \| `ftp.command` \| `ssh.version` \| `smtp.command` \| `smtp.sender` \| `smtp.recipient` \| `smb.command` \| `smb.filename` \| `modbus.function` \| `modbus.address` |
+| `buffer` | `payload` \| `http.uri` \| `http.host` \| `dns.query` \| `tls.sni` \| `tls.ja3` \| `ftp.command` \| `ssh.version` \| `smtp.command` \| `smtp.sender` \| `smtp.recipient` \| `smb.command` \| `smb.filename` \| `modbus.function` \| `modbus.address` \| `rdp.cookie` \| `tftp.opcode` \| `tftp.filename` \| `snmp.community` \| `dnp3.function` |
 | `direction` | `any` \| `to_server` \| `to_client` |
 | `type` | `literal` \| `regex` \| `not_literal` \| `not_regex` |
 | `pattern` | literal string, or a regex — always the *last* field, so it can safely contain `\|` |
@@ -559,6 +741,9 @@ ftp-anonymous-login|ftp.command|to_server|literal|USER anonymous
 smtp-relay-probe|smtp.command|to_server|literal|VRFY root
 smb-admin-share-access|smb.filename|to_server|regex|(?i)admin\$
 modbus-any-write|modbus.function|to_server|regex|^WRITE_
+rdp-admin-brute-force|rdp.cookie|to_server|regex|(?i)mstshash=administrator
+snmp-default-community|snmp.community|any|literal|public
+dnp3-device-control|dnp3.function|to_server|regex|^(OPERATE|DIRECT_OPERATE)
 ```
 
 See `rules.txt` for a fuller annotated example set. The old `-signatures`
@@ -572,23 +757,25 @@ buffers, not `payload` — "this pattern never appeared" is only
 meaningful once a buffer is known to be *complete*; a raw payload stream
 never really finishes from the engine's point of view.
 
-`ftp.command`, `smtp.command`/`smtp.sender`/`smtp.recipient`, and
-`smb.command`/`smb.filename` are all checked against **every new
-message as it arrives**, not just once — unlike a TLS ClientHello or an
-HTTP request line, one session of any of these protocols sends many
-commands/messages over its lifetime. `modbus.function`/`modbus.address`
-work the same way, but are also gated to port-502 traffic specifically
-— see "Two more protocols" above for why Modbus alone needs port-gating
-rather than content-sniffing. `ssh.version` is checked once per
-direction (the plaintext version banner is the only unencrypted part of
-an SSH connection). One consequence worth knowing: the existing
-per-flow, per-rule-name dedup (built for the one-shot buffers, to avoid
+`ftp.command`, `smtp.command`/`smtp.sender`/`smtp.recipient`,
+`smb.command`/`smb.filename`, and `modbus.function`/`modbus.address`/
+`dnp3.function` are all checked against **every new message as it
+arrives**, not just once — unlike a TLS ClientHello or an HTTP request
+line, one session of any of these protocols sends many commands/
+messages over its lifetime. `ssh.version` and `rdp.cookie` are each
+checked once per direction (SSH's plaintext version banner and RDP's
+initial connection request are each the only unencrypted moment of
+their respective connections). `tftp.opcode`/`tftp.filename` and
+`snmp.community` are checked once per UDP *packet*, since neither
+protocol has a persistent connection to reassemble — no dedup concerns
+there, each datagram is independent. One consequence worth knowing for
+the many-messages-per-session buffers: the existing per-flow,
+per-rule-name dedup (built for the one-shot buffers, to avoid
 re-alerting as a growing payload buffer keeps matching the same
 signature) also applies here, so if the *same* rule matches two
-*different* FTP/SMTP/SMB2/Modbus messages in one session, it only alerts
-on the first — a deliberate scope limitation to keep the dedup model
-uniform
-across every buffer type, not a bug.
+*different* messages in one session, it only alerts on the first — a
+deliberate scope limitation to keep the dedup model uniform across
+every buffer type, not a bug.
 
 ## Build & run
 
@@ -648,7 +835,7 @@ count of it in the stream.
 cargo test --release
 ```
 
-80 unit tests: 70 organized as submodules inside `engine.rs`
+106 unit tests: 96 organized as submodules inside `engine.rs`
 (`rules_tests`, `protocols_tests`, `signature_and_anomaly_tests`,
 `flow_tests`) plus `packet::tests` (now including IPv6 parsing,
 extension-header traversal, and literal parsing/formatting), plus 10 in
@@ -661,6 +848,37 @@ have shipped invisibly otherwise: every other test calls
 bug in how packets get distributed to workers in the first place. A few
 worth calling out specifically, because they test the properties that
 actually matter:
+
+- **`rules_tests::querying_with_direction_any_finds_rules_of_every_declared_direction`**
+  — the direct regression test for the biggest bug this project has
+  shipped: every UDP-based rule check (raw payload, DNS, TFTP, SNMP)
+  queries with `Direction::Any`, which used to be a literal lookup key
+  that nothing was ever stored under, silently breaking every one of
+  those rule types since DNS matching was first added. This test checks
+  all three rule-declaration forms (`any`, `to_server`, `to_client`)
+  against an `Any` query directly — the actual shape of the bug, not
+  just "does `RuleSet` work with a concrete direction," which every
+  earlier test already covered without ever catching this.
+- **`signature_and_anomaly_tests::different_signature_matches_are_not_mutually_suppressed`**
+  — regression test for the second bug the same live-testing pass
+  caught: two different rules matching the same source/destination/
+  protocol used to collide under one suppression key and the second was
+  silently dropped. Paired with
+  `repeated_matches_of_the_same_signature_still_suppress_normally`,
+  which proves the fix (keying `SIGNATURE_MATCH` suppression by message)
+  didn't quietly break the ordinary case of the same rule firing
+  repeatedly.
+- **`flow_tests::dnp3_frame_split_across_two_segments_still_parses`** /
+  **`rdp_connection_request_split_across_two_segments_still_parses`** —
+  the same reassembly-evasion property every TCP-based protocol here
+  gets tested for, now for DNP3's CRC-interleaved link-layer framing and
+  RDP's TPKT+X.224 framing specifically.
+- Every one of RDP/TFTP/SNMP/DNP3 was also verified against genuine
+  captured traffic during development — real TCP connections and UDP
+  datagrams, spec-accurate synthetic messages, captured live through
+  the actual `pcap` pipeline — not just unit-tested. That live
+  verification pass is what actually found the two bugs above; neither
+  would have been caught by the unit tests or code review alone.
 
 - **`flow_tests::smb2_message_split_across_two_segments_still_parses`**
   — the SMB2/Modbus equivalent of the reassembly regression test below:
@@ -785,6 +1003,18 @@ disabled — about 3x `parse_ethernet_frame`'s own cost — which is the
 honest price of a bounded memcpy per packet; `-pcap-retain 0` removes it
 entirely for anyone who'd rather not pay it.
 
+`literal_match` specifically has shown noticeably higher, but stable and
+repeatable, numbers on this sandbox during the RDP/TFTP/SNMP/DNP3 round
+(~170ns rather than the ~8ns figure above) — checked carefully rather
+than shipped past: the code path it exercises (`RuleSet::check_one`) is
+byte-for-byte unchanged from before that round, and the same elevated
+cost shows up even when calling with a concrete direction, a path the
+`Direction::Any` fix from that same round never touches — so whatever's
+behind it isn't a regression from that work, and correctness is
+unaffected (the full suite still passes). Not fully root-caused in the
+time available; worth re-measuring in a future round rather than
+trusting either number blindly.
+
 ## What's still not here
 
 Being honest about scope, since this is meant as an ongoing project:
@@ -800,10 +1030,20 @@ Being honest about scope, since this is meant as an ongoing project:
   SYNC header. See "Two more protocols" above for why each is a
   meaningfully different parser, not an extension of the one that's
   there.
-- **DNP3, BACnet, S7comm, and the rest of the industrial-protocol
-  family remain unparsed.** Modbus/TCP is the one covered so far —
+- **BACnet, S7comm, and the rest of the industrial-protocol family
+  remain unparsed.** Modbus/TCP and DNP3 are the two covered so far —
   "a dozen unrelated protocols" doesn't become one round's work just
-  because one of them is now done.
+  because two of them are now done.
+- **Telnet isn't parsed, on purpose.** Considered this round and
+  deliberately left out — see the intro. It has no clean protocol-level
+  command structure to reliably extract credentials from the way FTP's
+  `USER`/`PASS` commands do; it's an interactive character stream, and a
+  low-confidence parser built just to say the protocol is "covered"
+  isn't worth having.
+- **The RDP Negotiation Request isn't parsed** — only the cookie. Which
+  security protocols a client is offering to negotiate is lower-value
+  signal than the cookie's username hint, and parsing it isn't free of
+  its own edge cases worth getting right in a separate pass.
 - **No live threat-intel feeds.** The blacklist/rules are exactly as
   current as the last time you edited the files.
 - **No IPS capability.** Detection only — this can't block anything,
@@ -857,8 +1097,13 @@ Being honest about scope, since this is meant as an ongoing project:
    the endpoint legitimately logged its own session keys — the safer
    alternative to MITM interception discussed in "On TLS decryption"
    above, and a genuinely separate, smaller task from anything else here.
-8. **One more industrial protocol** (DNP3 is probably the next-most-
-   valuable after Modbus, given how common it is in North American
-   electric-utility SCADA specifically) — same pattern Modbus followed:
-   its own real parser, its own port-gating decision made on its own
-   merits, not assumed from Modbus's.
+8. **BACnet or S7comm** as the next industrial protocol, now that both
+   Modbus and DNP3 are covered — same pattern each followed: its own
+   real parser, its own port-gating (or content-sniffing) decision made
+   on its own merits, not assumed from the others'.
+9. **An audit of every other `Direction::Any` call site** in case any
+   other caller has been quietly relying on the same broken lookup
+   behavior the rule-engine fix above corrected — the fix itself should
+   make this a non-issue going forward, but it's worth double-checking
+   nothing else was built around the old (broken) behavior rather than
+   the new one.
