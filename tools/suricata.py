@@ -69,6 +69,7 @@ BUFFERS = {
     "ldap.request.dn": "ldap.dn",
     # File identity. A hash rule is the most portable kind there is.
     "filemd5": "file.md5", "file.md5": "file.md5",
+    "file.magic": "file.magic",
     "filesha256": "file.sha256", "file.sha256": "file.sha256",
     "http.header_names": "http.header_names", "http_header_names": "http.header_names",
     "http.request_line": "http.request_line",
@@ -86,18 +87,19 @@ BUFFERS = {
     "tls_cert_issuer": "tls.cert_issuer", "tls.cert_issuer": "tls.cert_issuer",
     "tls_cert_serial": "tls.cert_serial", "tls.cert_serial": "tls.cert_serial",
     "tls.certs": "tls.certs",
+    "ja3s.hash": "tls.ja3s", "ja3s_hash": "tls.ja3s",
 }
 
 # Buffers that exist in Suricata but not here. Named explicitly so the
 # stats distinguish "unsupported buffer" from "unknown option".
 UNSUPPORTED_BUFFERS = {
-    "file.name", "file.magic",
-    "tls.cert_fingerprint", "tls.version", "ja3s.hash", "ja3s_hash", "ja3.string",
+    "file.name",
+    "tls.cert_fingerprint", "ja3.string",
     "dns.opcode", "dns.answer.name", "dns.response",
     "ssh.proto", "ssh.software", "ssh_proto", "ssh_software",
 
     "sip.method", "sip.uri", "snmp.community", "dnp3_func", "modbus",
-    "base64_data", "icmpv6.mtu", "quic.sni", "quic.ua",
+    "icmpv6.mtu", "quic.sni", "quic.ua",
 }
 
 # Options that change matching semantics in ways ARGUS cannot express.
@@ -106,17 +108,16 @@ BLOCKING_OPTS = {
     # Byte-level extraction into named variables, which ARGUS has no
     # notion of. `byte_test` and `byte_jump` are expressible and handled;
     # these two define variables that later options refer to by name.
-    "byte_extract", "byte_math",
     # Cross-flow and cross-host state. `flowbits` is per-connection and
     # supported; these three are wider than one connection, and ARGUS
     # deliberately keeps no cross-connection rule state.
-    "flowint", "xbits", "hostbits",
+    "flowint",
     # Packet-level tests with no ARGUS equivalent.
     "ttl", "fragbits", "fragoffset",
     "id", "seq", "ack", "tos", "ipopts",
     "ssl_state", "ssl_version", "app-layer-protocol",
     "app-layer-event", "tls.fingerprint", "lua", "luajit", "datarep",
-    "dataset", "base64_decode", "entropy", "sameip", "geoip",
+    "dataset", "entropy", "sameip", "geoip",
     "asn1", "ftpbounce", "rpc", "replace", "prefilter", "filestore",
     "filemagic", "filename", "fileext", "filesize", "transform",
     # Response-side buffers: ARGUS reassembles client-to-server streams
@@ -193,7 +194,8 @@ IMPLICIT_TRANSFORMS = {"http.uri": ["percent_decode"]}
 # pseudo-headers, which HTTP/1 does not have, so on the traffic ARGUS
 # parses it changes nothing.
 TRANSFORM_OPTS = {"url_decode": "url_decode", "header_lowercase": "header_lowercase",
-                  "strip_whitespace": "strip_whitespace", "compress_whitespace": "compress_whitespace"}
+                  "strip_whitespace": "strip_whitespace", "compress_whitespace": "compress_whitespace",
+                  "to_sha1": "sha1", "to_md5": "md5", "to_sha256": "sha256"}
 NO_OP_TRANSFORMS = {"strip_pseudo_headers"}
 
 
@@ -300,6 +302,49 @@ def header_test_spec(name, value):
             return str(IP_PROTOS[v.lower()])
         return v if v.isdigit() else None
     return len_spec(v)
+
+
+def variable_op_spec(name, value):
+    """`byte_extract`, `byte_math` or `base64_decode` in the form ARGUS
+    reads, or None. ARGUS's own parser is the authority on the modifiers it
+    supports; this only checks the shape, so an unfamiliar form fails at
+    load (and is dropped by --validate) rather than meaning something else."""
+    parts = [" ".join(p.split()) for p in value.split(",")]
+    if any(not p for p in parts):
+        return None
+    if name == "byte_extract":
+        if len(parts) < 3 or not parts[0].isdigit() or not re.fullmatch(r"-?\d+", parts[1]) or not IDENT.match(parts[2]):
+            return None
+    elif name == "byte_math":
+        keys = {p.split(" ", 1)[0].lower() for p in parts}
+        if not {"bytes", "offset", "oper", "rvalue", "result"} <= keys:
+            return None
+    return ",".join(parts)
+
+
+XBIT_VERBS = ("set", "unset", "toggle", "isset", "isnotset")
+
+
+def xbit_spec(value):
+    """An `xbits`/`hostbits` body in the form ARGUS reads, or None."""
+    parts = [p.strip() for p in value.split(",")]
+    if len(parts) < 3 or parts[0].lower() not in XBIT_VERBS or not parts[1]:
+        return None
+    out = [parts[0].lower(), parts[1]]
+    seen = set()
+    for p in parts[2:]:
+        bits = p.split(None, 1)
+        if len(bits) != 2 or bits[0].lower() in seen:
+            return None
+        key, val = bits[0].lower(), bits[1].strip().lower()
+        seen.add(key)
+        if key == "track" and val in ("ip_src", "ip_dst", "ip_pair"):
+            out.append("track " + val)
+        elif key == "expire" and val.isdigit() and int(val) > 0:
+            out.append("expire " + val)
+        else:
+            return None
+    return ",".join(out) if "track" in seen else None
 
 
 def convert_content(value):
@@ -599,7 +644,8 @@ def normalise_regex(pat):
 
 
 LEN_RE = re.compile(r"^\s*(?:(?:<=|>=|<|>)?\s*\d+|\d+\s*<>\s*\d+)\s*$")
-DATAAT_RE = re.compile(r"^\s*(!)?\s*(\d+)\s*(?:,\s*(relative)\s*)?$", re.IGNORECASE)
+IDENT = re.compile(r"^[A-Za-z_][\w.]*$")
+DATAAT_RE = re.compile(r"^\s*(!)?\s*(\d+|[A-Za-z_][\w.]*)\s*(?:,\s*(relative)\s*)?$", re.IGNORECASE)
 
 
 def len_spec(value):
@@ -613,8 +659,8 @@ def len_spec(value):
 
 
 def dataat_spec(value):
-    """`[!]N[,relative]` normalised, or None. A named variable is not a
-    number, and there is nothing to resolve it against."""
+    """`[!]N[,relative]` normalised, or None. `N` may name a variable a
+    `byte_extract` or `byte_math` defined."""
     m = DATAAT_RE.match(value)
     if not m:
         return None
@@ -975,6 +1021,20 @@ def convert(line, home_net):
     deferred_len = []
     for o in opts:
         n, v = opt_name(o), opt_value(o)
+        if n == "tls.version" and v.strip():
+            # `tls.version:1.2` tests the version the server chose; it does
+            # not select a buffer for the contents that follow.
+            version = v.strip().strip('"')
+            if not re.fullmatch(r"\d\.\d", version):
+                return None, "'tls.version' form"
+            raw = version.encode()
+            terms.append({"kind": "content", "value": convert_content(chr(34) + version + chr(34)), "neg": False, "buffer": "tls.version",
+                          "mods": [], "raw": raw, "anchor_end": False, "dotprefix": False})
+            terms.append({"kind": "len", "value": str(len(raw)), "neg": False, "buffer": "tls.version",
+                          "mods": [], "raw": b"", "anchor_end": False, "dotprefix": False})
+            buffers_used.add("tls.version")
+            current = None
+            continue
         if n in BUFFERS:
             buffer_name = BUFFERS[n]
             buffers_used.add(buffer_name)
@@ -1091,9 +1151,22 @@ def convert(line, home_net):
                 vv = v.strip()
                 # A negative `distance` looks back over what was just
                 # matched, and ARGUS reads that. `within` cannot be negative.
-                if not (vv.isdigit() or (n == "distance" and vv.startswith("-") and vv[1:].isdigit())):
+                if not (vv.isdigit() or (n == "distance" and vv.startswith("-") and vv[1:].isdigit()) or IDENT.match(vv)):
                     return None, "'%s' is not a constant" % n
             current["mods"].append((n, v.strip()))
+            continue
+        if n == "base64_data":
+            # The decoded bytes are read by whatever follows `base64_decode`.
+            continue
+        if n in ("byte_extract", "byte_math", "base64_decode"):
+            spec = variable_op_spec(n, v)
+            if spec is None:
+                return None, "'%s' form" % n
+            terms.append({"kind": n, "value": spec, "neg": False,
+                          "buffer": buffer_name, "mods": [], "raw": b"",
+                          "anchor_end": False, "dotprefix": False})
+            buffers_used.add(buffer_name)
+            current = None
             continue
         if n in ("byte_test", "byte_jump"):
             # Passed through as written: the grammar is identical, and
@@ -1110,6 +1183,12 @@ def convert(line, home_net):
             # A byte op is not a content, so a following `distance`
             # would have nothing to attach to.
             current = None
+            continue
+        if n in ("xbits", "hostbits"):
+            spec = xbit_spec(v)
+            if spec is None:
+                return None, "'%s' form" % n
+            flowbit_terms.append("xbits:%s" % spec)
             continue
         if n in ("threshold", "detection_filter"):
             spec = rate_spec(n, v)
@@ -1298,6 +1377,8 @@ def convert(line, home_net):
             mods = dict(t["mods"])
             rest = [(m, mv) for m, mv in t["mods"] if m not in ("distance", "within")]
             if "distance" in mods or "within" in mods:
+                if not all(re.fullmatch(r"-?\d+", mods.get(k, "0")) for k in ("distance", "within")):
+                    return None, "a variable in a leading window"
                 start = max(int(mods.get("distance", "0")), 0)
                 rest.append(("offset", str(start)))
                 if "within" in mods:
@@ -1372,7 +1453,7 @@ def convert(line, home_net):
             parts.append('%s:"%s%s"' % (key, flags, pat))
             continue
 
-        if t["kind"] in ("byte_test", "byte_jump"):
+        if t["kind"] in ("byte_test", "byte_jump", "byte_extract", "byte_math", "base64_decode"):
             parts.append("%s:%s" % (t["kind"], t["value"]))
             continue
 
@@ -1441,6 +1522,10 @@ def normalise_byte_op(v, positional=4):
     for i, p in enumerate(parts[:positional]):
         if not p or (i == 1 and positional == 4 and p.lstrip("!") in ("<", ">", "=", "&", "^", "<=", ">=", "!")):
             continue
+        # A byte_test compares against, and reads at, a number or a named
+        # variable; the width and the operator are always literal.
+        if positional == 4 and i in (2, 3) and IDENT.match(p):
+            continue
         if not is_number(p):
             return None
     i = 0
@@ -1460,7 +1545,7 @@ def normalise_byte_op(v, positional=4):
             i += 1
             continue
         # The first few are positional; after that only known modifiers.
-        if len(out) >= 2 and low and low not in KNOWN_BYTE_MODS and not low[0].isdigit() and low[0] not in "!<>=&^-":
+        if len(out) >= positional and low and low not in KNOWN_BYTE_MODS and not low[0].isdigit() and low[0] not in "!<>=&^-":
             return None
         out.append(p)
         i += 1

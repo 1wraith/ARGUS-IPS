@@ -224,21 +224,24 @@ impl LenTest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DataAt {
     offset: usize,
+    /// The distance comes from a variable (`isdataat:!length`).
+    var: Option<u8>,
     relative: bool,
     negate: bool,
 }
 
 impl DataAt {
-    fn parse(spec: &str) -> anyhow::Result<DataAt> {
+    fn parse(spec: &str, vars: &VarTable) -> anyhow::Result<DataAt> {
         let mut parts = spec.split(',').map(str::trim);
         let first = parts.next().unwrap_or("");
         let (negate, digits) = match first.strip_prefix('!') {
             Some(rest) => (true, rest.trim()),
             None => (false, first),
         };
-        // A named variable from `byte_extract` is not a number, and there is
-        // nothing here to resolve it against.
-        let offset: usize = digits.parse().map_err(|_| anyhow::anyhow!("isdataat needs a number, got {:?}", digits))?;
+        let (offset, var) = match digits.parse::<usize>() {
+            Ok(n) => (n, None),
+            Err(_) => (0, Some(vars.lookup(digits)?)),
+        };
         let mut relative = false;
         for m in parts {
             match m.to_ascii_lowercase().as_str() {
@@ -247,13 +250,14 @@ impl DataAt {
                 other => anyhow::bail!("unknown isdataat modifier {:?}", other),
             }
         }
-        Ok(DataAt { offset, relative, negate })
+        Ok(DataAt { offset, var, relative, negate })
     }
 
     #[inline]
-    fn holds(self, len: usize, cursor: usize) -> bool {
+    fn holds(self, len: usize, cursor: usize, vars: &Vars) -> bool {
         let base = if self.relative { cursor } else { 0 };
-        (base.saturating_add(self.offset) < len) != self.negate
+        let Some(offset) = resolve(self.offset as i64, self.var, vars) else { return self.negate };
+        (base.saturating_add(offset.max(0) as usize) < len) != self.negate
     }
 }
 
@@ -615,11 +619,13 @@ pub struct ContentMatch {
     /// and lookbehind can see the bytes before it. Slicing would give
     /// `\bfoo` a word boundary it does not have in the real stream.
     resume: bool,
+    /// `offset`, `depth`, `distance` or `within` taken from a variable.
+    vars: [Option<u8>; 4],
 }
 
 impl ContentMatch {
     fn is_relative(&self) -> bool {
-        self.distance.is_some() || self.within.is_some() || self.resume
+        self.distance.is_some() || self.within.is_some() || self.resume || self.vars[2].is_some() || self.vars[3].is_some()
     }
 
     /// What a regex that gave up counts as: not a match, unless negated,
@@ -637,8 +643,21 @@ impl ContentMatch {
     /// of the URI" is a signature. Relative anchoring is the stronger
     /// form of the same idea: "this string immediately after that one"
     /// is a statement about structure, not about coincidence.
-    fn bounds(&self, len: usize, cursor: usize) -> (usize, usize) {
-        if self.is_relative() {
+    fn bounds(&self, len: usize, cursor: usize, vars: &Vars) -> Option<(usize, usize)> {
+        let [v_offset, v_depth, v_distance, v_within] = self.vars;
+        let distance = resolve(self.distance.unwrap_or(0), v_distance, vars)?;
+        let within = match self.within {
+            Some(w) => Some(resolve(w as i64, v_within, vars)?.max(0) as usize),
+            None if v_within.is_some() => Some(resolve(0, v_within, vars)?.max(0) as usize),
+            None => None,
+        };
+        let offset = resolve(self.offset as i64, v_offset, vars)?.max(0) as usize;
+        let depth = match self.depth {
+            Some(d) => Some(resolve(d as i64, v_depth, vars)?.max(0) as usize),
+            None if v_depth.is_some() => Some(resolve(0, v_depth, vars)?.max(0) as usize),
+            None => None,
+        };
+        Some(if self.is_relative() {
             // `distance` moves the start of the window, and may be negative
             // to look back over what was just matched. `within` bounds where
             // the match must *end*, measured from the end of the previous
@@ -648,24 +667,24 @@ impl ContentMatch {
             // third. (That is what the field's own doc says, what the
             // ordinary case `distance:0` cannot tell apart, and what
             // Suricata does.)
-            let start = (cursor as i64).saturating_add(self.distance.unwrap_or(0)).clamp(0, len as i64) as usize;
-            let end = match self.within {
+            let start = (cursor as i64).saturating_add(distance).clamp(0, len as i64) as usize;
+            let end = match within {
                 Some(w) => cursor.saturating_add(w).min(len),
                 None => len,
             };
             (start, end)
         } else {
-            let start = self.offset.min(len);
-            let end = match self.depth {
+            let start = offset.min(len);
+            let end = match depth {
                 Some(d) => start.saturating_add(d).min(len),
                 None => len,
             };
             (start, end)
-        }
+        })
     }
 
     /// Where this term matches, in absolute buffer coordinates.
-    fn find(&self, data: &[u8], cursor: usize) -> Option<(usize, usize)> {
+    fn find(&self, data: &[u8], cursor: usize, vars: &Vars) -> Option<(usize, usize)> {
         if self.resume {
             let from = cursor.min(data.len());
             return match &self.pattern {
@@ -677,7 +696,7 @@ impl ContentMatch {
                 Pattern::Literal(_) | Pattern::NoCase(_) => None,
             };
         }
-        let (start, end) = self.bounds(data.len(), cursor);
+        let (start, end) = self.bounds(data.len(), cursor, vars)?;
         if start > end {
             return None;
         }
@@ -847,13 +866,177 @@ impl NumberFormat {
     }
 }
 
+/// How many named values a rule may extract.
+pub const MAX_VARS: usize = 8;
+
+/// The values a rule's `byte_extract` and `byte_math` terms have produced
+/// so far in one evaluation. `None` is a variable nothing has set.
+type Vars = [Option<i64>; MAX_VARS];
+
+/// The names a rule has defined, in order. A name is its index.
+#[derive(Default)]
+struct VarTable {
+    names: Vec<String>,
+}
+
+impl VarTable {
+    fn define(&mut self, name: &str) -> anyhow::Result<u8> {
+        let name = name.trim();
+        anyhow::ensure!(!name.is_empty(), "a variable needs a name");
+        if let Some(i) = self.names.iter().position(|n| n == name) {
+            return Ok(i as u8);
+        }
+        anyhow::ensure!(self.names.len() < MAX_VARS, "a rule may name at most {} variables", MAX_VARS);
+        self.names.push(name.to_string());
+        Ok((self.names.len() - 1) as u8)
+    }
+
+    fn lookup(&self, name: &str) -> anyhow::Result<u8> {
+        let name = name.trim();
+        self.names.iter().position(|n| n == name).map(|i| i as u8).ok_or_else(|| anyhow::anyhow!("{:?} is neither a number nor a variable this rule has extracted", name))
+    }
+
+    /// A literal number, or the variable that will supply one.
+    fn number_or_var(&self, raw: &str) -> anyhow::Result<(i64, Option<u8>)> {
+        match parse_integer(raw) {
+            Ok(v) => Ok((v as i64, None)),
+            Err(_) => match raw.trim().parse::<i64>() {
+                Ok(v) => Ok((v, None)),
+                Err(_) => Ok((0, Some(self.lookup(raw)?))),
+            },
+        }
+    }
+}
+
+/// The value of a term's argument: its literal, or the variable it names.
+#[inline]
+fn resolve(literal: i64, var: Option<u8>, vars: &Vars) -> Option<i64> {
+    match var {
+        Some(v) => vars[v as usize],
+        None => Some(literal),
+    }
+}
+
+/// `byte_extract`: read a number and remember it under a name, for the
+/// terms after it to use as a length, an offset or a limit. Rules that
+/// parse a length field and then check something against it are written
+/// this way.
+#[derive(Clone, Debug)]
+pub struct ByteExtract {
+    bytes: usize,
+    offset: i64,
+    relative: bool,
+    format: NumberFormat,
+    multiplier: i64,
+    var: u8,
+}
+
+impl ByteExtract {
+    fn eval(&self, data: &[u8], cursor: usize, vars: &mut Vars) -> bool {
+        let base = if self.relative { cursor } else { 0 };
+        let Some(at) = shift(base, self.offset) else { return false };
+        let Some((v, _)) = self.format.read(data, at, self.bytes) else { return false };
+        let Some(v) = i64::try_from(v).ok().and_then(|v| v.checked_mul(self.multiplier)) else { return false };
+        vars[self.var as usize] = Some(v);
+        true
+    }
+}
+
+/// `byte_math`: read a number, do arithmetic on it, and remember the result.
+#[derive(Clone, Debug)]
+pub struct ByteMath {
+    bytes: usize,
+    offset: i64,
+    relative: bool,
+    format: NumberFormat,
+    oper: char,
+    rvalue: i64,
+    rvalue_var: Option<u8>,
+    var: u8,
+}
+
+impl ByteMath {
+    fn eval(&self, data: &[u8], cursor: usize, vars: &mut Vars) -> bool {
+        let base = if self.relative { cursor } else { 0 };
+        let Some(at) = shift(base, self.offset) else { return false };
+        let Some((v, _)) = self.format.read(data, at, self.bytes) else { return false };
+        let (Ok(lhs), Some(rhs)) = (i64::try_from(v), resolve(self.rvalue, self.rvalue_var, vars)) else { return false };
+        let out = match self.oper {
+            '+' => lhs.checked_add(rhs),
+            '-' => lhs.checked_sub(rhs),
+            '*' => lhs.checked_mul(rhs),
+            '/' => lhs.checked_div(rhs),
+            '<' => u32::try_from(rhs).ok().and_then(|n| lhs.checked_shl(n)),
+            '>' => u32::try_from(rhs).ok().and_then(|n| lhs.checked_shr(n)),
+            _ => None,
+        };
+        match out {
+            Some(r) => {
+                vars[self.var as usize] = Some(r);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// `base64_decode`: from here on, the rule's terms read the decoded bytes.
+///
+/// The bytes are taken from `offset` (from the cursor if `relative`) for
+/// `bytes` bytes, or to the end of the buffer if that is zero. Characters
+/// outside the base64 alphabet, whitespace included, are skipped, and
+/// decoding stops at padding: the tolerant reading, since these rules are
+/// about encoded content that is rarely well-formed.
+#[derive(Clone, Debug)]
+pub struct Base64Decode {
+    bytes: usize,
+    offset: i64,
+    relative: bool,
+}
+
+impl Base64Decode {
+    fn eval(&self, data: &[u8], cursor: usize) -> Option<Vec<u8>> {
+        let base = if self.relative { cursor } else { 0 };
+        let start = shift(base, self.offset)?.min(data.len());
+        let end = if self.bytes == 0 { data.len() } else { start.saturating_add(self.bytes).min(data.len()) };
+        Some(base64_decode(&data[start..end]))
+    }
+}
+
+fn base64_decode(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len() / 4 * 3 + 3);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for &b in input {
+        let v = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' => break,
+            _ => continue,
+        };
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    out
+}
+
 /// `byte_test`: read a number out of the buffer and compare it.
 #[derive(Clone, Debug)]
 pub struct ByteTest {
     bytes: usize,
     op: ByteOp,
     value: u64,
+    /// The value comes from a variable rather than the rule text.
+    value_var: Option<u8>,
     offset: i64,
+    offset_var: Option<u8>,
     relative: bool,
     format: NumberFormat,
     negate: bool,
@@ -892,11 +1075,12 @@ fn shift(base: usize, delta: i64) -> Option<usize> {
 }
 
 impl ByteTest {
-    fn eval(&self, data: &[u8], cursor: usize) -> bool {
+    fn eval(&self, data: &[u8], cursor: usize, vars: &Vars) -> bool {
         let base = if self.relative { cursor } else { 0 };
-        let Some(at) = shift(base, self.offset) else { return self.negate };
+        let (Some(offset), Some(value)) = (resolve(self.offset, self.offset_var, vars), resolve(self.value as i64, self.value_var, vars)) else { return self.negate };
+        let Some(at) = shift(base, offset) else { return self.negate };
         let hit = match self.format.read(data, at, self.bytes) {
-            Some((v, _)) => self.op.eval(v, self.value),
+            Some((v, _)) => self.op.eval(v, value as u64),
             // A test that cannot read its bytes has not passed. Treating
             // a truncated buffer as a match would make every rule using
             // byte_test fire on runt packets.
@@ -956,6 +1140,10 @@ pub enum Transform {
     StripWhitespace,
     /// Every run of whitespace reduced to one space.
     CompressWhitespace,
+    /// The buffer's raw digest, so a rule can name content by its hash.
+    Sha1,
+    Md5,
+    Sha256,
 }
 
 impl Transform {
@@ -966,6 +1154,9 @@ impl Transform {
             "header_lowercase" => Transform::HeaderLowercase,
             "strip_whitespace" => Transform::StripWhitespace,
             "compress_whitespace" => Transform::CompressWhitespace,
+            "sha1" => Transform::Sha1,
+            "md5" => Transform::Md5,
+            "sha256" => Transform::Sha256,
             other => anyhow::bail!("unknown transform {:?}", other),
         })
     }
@@ -1017,6 +1208,9 @@ impl Transform {
                 (out != data).then_some(out)
             }
             Transform::StripWhitespace => data.iter().any(|&b| is_ws(b)).then(|| data.iter().copied().filter(|&b| !is_ws(b)).collect()),
+            Transform::Sha1 => Some(crate::files::sha1(data).to_vec()),
+            Transform::Md5 => Some(crate::files::md5_raw(data)),
+            Transform::Sha256 => Some(crate::files::sha256_raw(data)),
             Transform::CompressWhitespace => {
                 let mut out = Vec::with_capacity(data.len());
                 for &b in data {
@@ -1062,6 +1256,11 @@ fn split_transforms(terms: Vec<Term>) -> (Vec<Transform>, Vec<Term>) {
 enum Term {
     /// Not a test: a change to the buffer that the tests after it see.
     Transform(Transform),
+    /// Remembers a number under a name for later terms.
+    Extract(ByteExtract),
+    Math(ByteMath),
+    /// From here on the terms read the base64-decoded bytes.
+    Base64(Base64Decode),
     Content(ContentMatch),
     Test(ByteTest),
     Jump(ByteJump),
@@ -1229,6 +1428,8 @@ pub struct Rule {
     pub part: Option<(u32, u8)>,
     /// `threshold` or `detection_filter`: how often a match is reported.
     pub threshold: Option<crate::threshold::Threshold>,
+    /// `xbits`/`hostbits`: state shared between connections.
+    pub xbits: Vec<crate::threshold::XbitOp>,
 }
 
 /// A rule that inspects more than one buffer, e.g. a request URI *and* a
@@ -1252,6 +1453,7 @@ pub struct Composite {
     pub severity: Severity,
     pub parts: u8,
     pub threshold: Option<crate::threshold::Threshold>,
+    pub xbits: Vec<crate::threshold::XbitOp>,
     /// `set`/`unset`/`toggle` effects, applied on completion.
     pub effects: Vec<Flowbit>,
     pub noalert: bool,
@@ -1284,9 +1486,14 @@ impl Rule {
     /// something absent would have been.
     pub fn content_matches(&self, data: &[u8]) -> bool {
         let mut cursor = 0usize;
+        let mut vars: Vars = [None; MAX_VARS];
+        // What the terms read. It is the buffer until a `base64_decode`,
+        // and the decoded bytes after it.
+        let mut view: std::borrow::Cow<[u8]> = std::borrow::Cow::Borrowed(data);
         for term in &self.terms {
+            let data: &[u8] = &view;
             match term {
-                Term::Content(c) => match c.find(data, cursor) {
+                Term::Content(c) => match c.find(data, cursor, &vars) {
                     Some((_, end)) => {
                         if c.negate {
                             return false;
@@ -1300,7 +1507,7 @@ impl Rule {
                     }
                 },
                 Term::Test(t) => {
-                    if !t.eval(data, cursor) {
+                    if !t.eval(data, cursor, &vars) {
                         return false;
                     }
                 }
@@ -1314,10 +1521,27 @@ impl Rule {
                     }
                 }
                 Term::DataAt(d) => {
-                    if !d.holds(data.len(), cursor) {
+                    if !d.holds(data.len(), cursor, &vars) {
                         return false;
                     }
                 }
+                Term::Extract(e) => {
+                    if !e.eval(data, cursor, &mut vars) {
+                        return false;
+                    }
+                }
+                Term::Math(m) => {
+                    if !m.eval(data, cursor, &mut vars) {
+                        return false;
+                    }
+                }
+                Term::Base64(b) => match b.eval(data, cursor) {
+                    Some(decoded) => {
+                        view = std::borrow::Cow::Owned(decoded);
+                        cursor = 0;
+                    }
+                    None => return false,
+                },
                 // Applied before evaluation, by the rule set.
                 Term::Transform(_) => {}
             }
@@ -1355,12 +1579,16 @@ impl Rule {
         self.flowbits.iter().any(|f| matches!(f.op, FlowbitOp::Set | FlowbitOp::Unset | FlowbitOp::Toggle))
     }
 
-    fn contents(&self) -> impl Iterator<Item = &ContentMatch> {
-        self.terms.iter().filter_map(|t| match t {
+    /// Contents that read the buffer as it is, which is all a prefilter
+    /// can see: anything after a `base64_decode` reads decoded bytes that
+    /// the prefilter never has.
+    fn prefilter_contents(&self) -> impl Iterator<Item = &ContentMatch> {
+        self.terms.iter().take_while(|t| !matches!(t, Term::Base64(_))).filter_map(|t| match t {
             Term::Content(c) => Some(c),
             _ => None,
         })
     }
+
 }
 
 /// What fired, with enough identity to be acted on downstream.
@@ -1593,6 +1821,8 @@ pub fn parse_any(line: &str, flowbits: &mut FlowbitRegistry) -> anyhow::Result<P
     let mut bits: Vec<Flowbit> = Vec::new();
     let mut noalert = false;
     let mut threshold = None;
+    let mut xbits: Vec<crate::threshold::XbitOp> = Vec::new();
+    let mut vars = VarTable::default();
 
     // `content` and friends push; the modifiers that follow one need to
     // reach back to it.
@@ -1683,6 +1913,7 @@ pub fn parse_any(line: &str, flowbits: &mut FlowbitRegistry) -> anyhow::Result<P
                 distance: None,
                 within: None,
                 resume: false,
+                vars: [None; 4],
             })),
             "pcre" | "regex" | "!pcre" | "!regex" => {
                 // Quotes stripped, but *no* escape processing: a regex
@@ -1701,6 +1932,7 @@ pub fn parse_any(line: &str, flowbits: &mut FlowbitRegistry) -> anyhow::Result<P
                     distance: None,
                     within: None,
                     resume: false,
+                    vars: [None; 4],
                 }));
             }
             "pcre_bt" | "!pcre_bt" => {
@@ -1716,13 +1948,32 @@ pub fn parse_any(line: &str, flowbits: &mut FlowbitRegistry) -> anyhow::Result<P
                     distance: None,
                     within: None,
                     resume: false,
+                    vars: [None; 4],
                 }));
             }
-            "offset" => last_content!("offset").offset = value.parse::<usize>()?,
-            "depth" => last_content!("depth").depth = Some(value.parse::<usize>()?),
-            "distance" => last_content!("distance").distance = Some(value.parse::<i64>()?),
-            "within" => last_content!("within").within = Some(value.parse::<usize>()?),
+            // Each of these takes a number, or the name of a variable an
+            // earlier `byte_extract` or `byte_math` defined.
+            "offset" => match value.parse::<usize>() {
+                Ok(n) => last_content!("offset").offset = n,
+                Err(_) => last_content!("offset").vars[0] = Some(vars.lookup(value)?),
+            },
+            "depth" => match value.parse::<usize>() {
+                Ok(n) => last_content!("depth").depth = Some(n),
+                Err(_) => last_content!("depth").vars[1] = Some(vars.lookup(value)?),
+            },
+            "distance" => match value.parse::<i64>() {
+                Ok(n) => last_content!("distance").distance = Some(n),
+                Err(_) => last_content!("distance").vars[2] = Some(vars.lookup(value)?),
+            },
+            "within" => match value.parse::<usize>() {
+                Ok(n) => last_content!("within").within = Some(n),
+                Err(_) => last_content!("within").vars[3] = Some(vars.lookup(value)?),
+            },
+            "byte_extract" => terms.push(Term::Extract(parse_byte_extract(value, &mut vars)?)),
+            "byte_math" => terms.push(Term::Math(parse_byte_math(value, &mut vars)?)),
+            "base64_decode" => terms.push(Term::Base64(parse_base64_decode(value)?)),
 
+            "xbits" | "hostbits" => xbits.push(crate::threshold::XbitOp::parse(value)?),
             "threshold" => threshold = Some(crate::threshold::Threshold::parse(value)?),
             "detection_filter" => threshold = Some(crate::threshold::Threshold::parse_detection_filter(value)?),
             "dsize" => header.payload_len = Some(LenTest::parse(value)?),
@@ -1737,8 +1988,8 @@ pub fn parse_any(line: &str, flowbits: &mut FlowbitRegistry) -> anyhow::Result<P
                 terms.push(Term::Transform(Transform::parse(&unquote_plain(value))?));
             }
             "bsize" => terms.push(Term::Len(LenTest::parse(value)?)),
-            "isdataat" => terms.push(Term::DataAt(DataAt::parse(value)?)),
-            "byte_test" => terms.push(Term::Test(parse_byte_test(value)?)),
+            "isdataat" => terms.push(Term::DataAt(DataAt::parse(value, &vars)?)),
+            "byte_test" => terms.push(Term::Test(parse_byte_test(value, &vars)?)),
             "byte_jump" => terms.push(Term::Jump(parse_byte_jump(value)?)),
 
             "flowbits" => {
@@ -1770,7 +2021,7 @@ pub fn parse_any(line: &str, flowbits: &mut FlowbitRegistry) -> anyhow::Result<P
     if finished.len() > 1 {
         let sid = sid.ok_or_else(|| anyhow::anyhow!("rule is missing 'sid'"))?;
         let name = name.unwrap_or_else(|| format!("sid-{}", sid));
-        return lower_composite(sid, name, severity, direction, header, finished, bits, noalert, threshold, flowbits);
+        return lower_composite(sid, name, severity, direction, header, finished, bits, noalert, threshold, xbits, flowbits);
     }
     if let Some((b, t)) = finished.pop() {
         buffer = b;
@@ -1815,7 +2066,7 @@ pub fn parse_any(line: &str, flowbits: &mut FlowbitRegistry) -> anyhow::Result<P
     let name = name.unwrap_or_else(|| format!("sid-{}", sid));
 
     let (transforms, terms) = split_transforms(terms);
-    Ok(Parsed::Single(Rule { sid, name, severity, buffer, direction, header, terms, transforms, flowbits: bits, noalert, part: None, threshold }))
+    Ok(Parsed::Single(Rule { sid, name, severity, buffer, direction, header, terms, transforms, flowbits: bits, noalert, part: None, threshold, xbits }))
 }
 
 /// Lowers a multi-buffer rule into per-buffer parts plus a [`Composite`].
@@ -1830,6 +2081,7 @@ fn lower_composite(
     bits: Vec<Flowbit>,
     noalert: bool,
     threshold: Option<crate::threshold::Threshold>,
+    xbits: Vec<crate::threshold::XbitOp>,
     reg: &mut FlowbitRegistry,
 ) -> anyhow::Result<Parsed> {
     anyhow::ensure!(parts.len() <= MAX_PARTS, "a rule may inspect at most {} buffers, this one names {}", MAX_PARTS, parts.len());
@@ -1901,9 +2153,10 @@ fn lower_composite(
             noalert: true,
             part: Some((id, i as u8)),
             threshold: None,
+            xbits: Vec::new(),
         });
     }
-    Ok(Parsed::Composite { composite: Composite { id, sid, name, severity, parts: total, threshold, effects, noalert }, parts: rules })
+    Ok(Parsed::Composite { composite: Composite { id, sid, name, severity, parts: total, threshold, xbits, effects, noalert }, parts: rules })
 }
 
 /// Shared tail of `byte_test` and `byte_jump`: the comma-separated
@@ -1979,12 +2232,12 @@ fn digits_to_read(bytes: usize, format: NumberFormat, what: &str) -> anyhow::Res
 }
 
 /// `byte_test:<bytes>,<op>,<value>,<offset>[,modifiers...]`
-fn parse_byte_test(value: &str) -> anyhow::Result<ByteTest> {
+fn parse_byte_test(value: &str, vars: &VarTable) -> anyhow::Result<ByteTest> {
     let mut parts = value.split(',').map(str::trim);
     let bytes: usize = parts.next().ok_or_else(|| anyhow::anyhow!("byte_test needs a byte count"))?.parse()?;
     let op_raw = parts.next().ok_or_else(|| anyhow::anyhow!("byte_test needs an operator"))?;
     let value_raw = parts.next().ok_or_else(|| anyhow::anyhow!("byte_test needs a value"))?;
-    let offset: i64 = parts.next().ok_or_else(|| anyhow::anyhow!("byte_test needs an offset"))?.parse()?;
+    let (offset, offset_var) = vars.number_or_var(parts.next().ok_or_else(|| anyhow::anyhow!("byte_test needs an offset"))?)?;
 
     // A leading '!' negates the whole test, and is written attached to
     // the operator.
@@ -1993,7 +2246,10 @@ fn parse_byte_test(value: &str) -> anyhow::Result<ByteTest> {
         _ => (false, op_raw),
     };
     let op = ByteOp::parse(op_str)?;
-    let cmp = parse_integer(value_raw)?;
+    let (cmp, value_var) = match parse_integer(value_raw) {
+        Ok(v) => (v, None),
+        Err(_) => (0, Some(vars.lookup(value_raw)?)),
+    };
     let m = parse_numeric_modifiers(parts)?;
     let bytes = digits_to_read(bytes, m.format, "byte_test")?;
     anyhow::ensure!(
@@ -2001,7 +2257,74 @@ fn parse_byte_test(value: &str) -> anyhow::Result<ByteTest> {
         "byte_test can read at most 8 binary bytes, got {}",
         bytes
     );
-    Ok(ByteTest { bytes, op, value: cmp, offset, relative: m.relative, format: m.format, negate: negate || m.negate })
+    Ok(ByteTest { bytes, op, value: cmp, value_var, offset, offset_var, relative: m.relative, format: m.format, negate: negate || m.negate })
+}
+
+/// `byte_extract:<bytes>,<offset>,<name>[,modifiers...]`
+fn parse_byte_extract(value: &str, vars: &mut VarTable) -> anyhow::Result<ByteExtract> {
+    let mut parts = value.split(',').map(str::trim);
+    let bytes: usize = parts.next().ok_or_else(|| anyhow::anyhow!("byte_extract needs a byte count"))?.parse()?;
+    let offset: i64 = parts.next().ok_or_else(|| anyhow::anyhow!("byte_extract needs an offset"))?.parse()?;
+    let name = parts.next().ok_or_else(|| anyhow::anyhow!("byte_extract needs a variable name"))?;
+    let m = parse_numeric_modifiers(parts)?;
+    let bytes = digits_to_read(bytes, m.format, "byte_extract")?;
+    anyhow::ensure!(matches!(m.format, NumberFormat::Text(_)) || bytes <= 8, "byte_extract can read at most 8 binary bytes, got {}", bytes);
+    anyhow::ensure!(!m.align && m.post_offset == 0 && !m.from_beginning, "byte_extract does not take align, post_offset or from_beginning");
+    let var = vars.define(name)?;
+    Ok(ByteExtract { bytes, offset, relative: m.relative, format: m.format, multiplier: i64::try_from(m.multiplier)?, var })
+}
+
+/// `byte_math:bytes N, offset N, oper +, rvalue N|name, result name[, relative][, endian big|little][, string dec]`
+fn parse_byte_math(value: &str, vars: &mut VarTable) -> anyhow::Result<ByteMath> {
+    let (mut bytes, mut offset, mut oper, mut rvalue, mut result) = (None, None, None, None, None);
+    let mut modifiers: Vec<String> = Vec::new();
+    for part in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (key, val) = part.split_once(char::is_whitespace).map(|(k, v)| (k, v.trim())).unwrap_or((part, ""));
+        match key.to_ascii_lowercase().as_str() {
+            "bytes" => bytes = Some(val.parse::<usize>()?),
+            "offset" => offset = Some(val.parse::<i64>()?),
+            "oper" => oper = Some(val.to_string()),
+            "rvalue" => rvalue = Some(val.to_string()),
+            "result" => result = Some(val.to_string()),
+            "relative" | "big" | "little" | "hex" | "dec" | "oct" | "string" => modifiers.push(key.to_string()),
+            "endian" => modifiers.push(val.to_string()),
+            other => anyhow::bail!("unsupported byte_math field {:?}", other),
+        }
+    }
+    let bytes = bytes.ok_or_else(|| anyhow::anyhow!("byte_math needs 'bytes'"))?;
+    let offset = offset.ok_or_else(|| anyhow::anyhow!("byte_math needs 'offset'"))?;
+    let oper = match oper.ok_or_else(|| anyhow::anyhow!("byte_math needs 'oper'"))?.as_str() {
+        "+" => '+',
+        "-" => '-',
+        "*" => '*',
+        "/" => '/',
+        "<<" => '<',
+        ">>" => '>',
+        other => anyhow::bail!("unknown byte_math operator {:?}", other),
+    };
+    let (rvalue, rvalue_var) = vars.number_or_var(&rvalue.ok_or_else(|| anyhow::anyhow!("byte_math needs 'rvalue'"))?)?;
+    let m = parse_numeric_modifiers(modifiers.iter().map(String::as_str))?;
+    let bytes = digits_to_read(bytes, m.format, "byte_math")?;
+    anyhow::ensure!(matches!(m.format, NumberFormat::Text(_)) || bytes <= 8, "byte_math can read at most 8 binary bytes, got {}", bytes);
+    let var = vars.define(&result.ok_or_else(|| anyhow::anyhow!("byte_math needs 'result'"))?)?;
+    Ok(ByteMath { bytes, offset, relative: m.relative, format: m.format, oper, rvalue, rvalue_var, var })
+}
+
+/// `base64_decode:[bytes N][,offset N][,relative][,mode ...]`
+fn parse_base64_decode(value: &str) -> anyhow::Result<Base64Decode> {
+    let (mut bytes, mut offset, mut relative) = (0usize, 0i64, false);
+    for part in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (key, val) = part.split_once(char::is_whitespace).map(|(k, v)| (k, v.trim())).unwrap_or((part, ""));
+        match key.to_ascii_lowercase().as_str() {
+            "bytes" => bytes = val.parse()?,
+            "offset" => offset = val.parse()?,
+            "relative" => relative = true,
+            // Every mode is read tolerantly; see `Base64Decode`.
+            "mode" => {}
+            other => anyhow::bail!("unsupported base64_decode field {:?}", other),
+        }
+    }
+    Ok(Base64Decode { bytes, offset, relative })
 }
 
 /// `byte_jump:<bytes>,<offset>[,modifiers...]`
@@ -2072,7 +2395,9 @@ fn evaluate_rule(rule: &Rule, p: &Packet, evaluate: Direction, data: &[u8], bits
     if !rule.header.matches(p, evaluate) || !rule.stream_holds(bits) || !rule.flowbits_hold(bits) || !rule.content_matches(data) {
         return false;
     }
-    if !rule.noalert {
+    // A rule that only sets cross-connection state still has to reach
+    // the stage that holds it; that stage decides it is not reported.
+    if !rule.noalert || !rule.xbits.is_empty() {
         out.push(RuleHit { name: rule.name.clone(), sid: rule.sid, severity: rule.severity });
     }
     rule.sets_flowbits() || rule.part.is_some()
@@ -2093,6 +2418,8 @@ struct RuleGroup {
     pattern_owner: Vec<usize>,
     /// Rules that must be evaluated unconditionally.
     always: Vec<Rule>,
+    /// The longest prefilter literal, in bytes.
+    max_pattern: usize,
 }
 
 impl RuleGroup {
@@ -2104,7 +2431,7 @@ impl RuleGroup {
         for rule in group {
             // The longest required literal is the most selective one
             // available, so it makes the best prefilter key.
-            let literal = rule.contents().filter_map(|c| c.prefilter_literal()).max_by_key(|l| l.len()).map(|l| l.to_vec());
+            let literal = rule.prefilter_contents().filter_map(|c| c.prefilter_literal()).max_by_key(|l| l.len()).map(|l| l.to_vec());
             match literal {
                 Some(lit) => {
                     let idx = prefiltered.len();
@@ -2119,7 +2446,8 @@ impl RuleGroup {
         // For a case-sensitive rule this only admits extra candidates,
         // each of which is then checked exactly.
         let prefilter = if patterns.is_empty() { None } else { Some(AhoCorasick::builder().ascii_case_insensitive(true).build(&patterns)?) };
-        Ok(RuleGroup { prefiltered, prefilter, pattern_owner, always })
+        let max_pattern = patterns.iter().map(Vec::len).max().unwrap_or(0);
+        Ok(RuleGroup { prefiltered, prefilter, pattern_owner, always, max_pattern })
     }
 }
 
@@ -2150,6 +2478,32 @@ struct RuleSlice {
     /// yet apply.
     gate: Option<u32>,
     rules: RuleGroup,
+}
+
+/// What has been learned about one direction of one connection's stream by
+/// scanning it as it grew.
+///
+/// The raw payload is matched against the *whole* reassembled stream on
+/// every new segment, which is what defeats a signature split across
+/// packets. Doing that by scanning the whole stream again each time makes
+/// the cost of a connection quadratic in its length, and it was the largest
+/// single cost of running a real ruleset. But a scan only needs to look at
+/// the new bytes (and enough of the old to catch a literal straddling the
+/// join): the rules whose literals were found earlier are remembered, and
+/// each is still evaluated against the whole stream, as before.
+#[derive(Default)]
+pub struct StreamScan {
+    slices: Vec<SliceScan>,
+}
+
+#[derive(Default)]
+struct SliceScan {
+    /// How much of the stream has been scanned.
+    upto: usize,
+    /// Which rules of the group have had a literal found, as a bit set and
+    /// as a list (the list is what is evaluated).
+    seen: Vec<u64>,
+    hits: Vec<u32>,
 }
 
 /// Reusable working memory for matching, owned by whatever is doing the
@@ -2206,9 +2560,16 @@ pub struct RuleSetV2 {
     /// Whether any rule reads the per-packet buffer. Asked once per packet,
     /// so it is worked out at load.
     packet_rules: bool,
+    /// Cross-connection state operations by rule id, applied by the gate.
+    xbits: FxHashMap<u32, crate::threshold::XbitSpec>,
 }
 
 impl RuleSetV2 {
+    /// The `xbits` operations of a rule, if it has any.
+    pub fn xbits_for(&self, sid: u32) -> Option<crate::threshold::XbitSpec> {
+        self.xbits.get(&sid).cloned()
+    }
+
     pub fn has_packet_rules(&self) -> bool {
         self.packet_rules
     }
@@ -2291,6 +2652,12 @@ impl RuleSetV2 {
         let count = rules.iter().filter(|r| r.part.is_none()).count() + composites.len();
         let thresholds: FxHashMap<u32, crate::threshold::Threshold> =
             rules.iter().filter_map(|r| r.threshold.map(|t| (r.sid, t))).chain(composites.iter().filter_map(|c| c.threshold.map(|t| (c.sid, t)))).collect();
+        let rules_xbits: FxHashMap<u32, crate::threshold::XbitSpec> = rules
+            .iter()
+            .filter(|r| !r.xbits.is_empty())
+            .map(|r| (r.sid, crate::threshold::XbitSpec { ops: r.xbits.clone(), noalert: r.noalert }))
+            .chain(composites.iter().filter(|c| !c.xbits.is_empty()).map(|c| (c.sid, crate::threshold::XbitSpec { ops: c.xbits.clone(), noalert: c.noalert })))
+            .collect();
         for rule in rules {
             let dirs: &[Direction] = match rule.direction {
                 Direction::Any => &[Direction::ToServer, Direction::ToClient],
@@ -2315,8 +2682,9 @@ impl RuleSetV2 {
             let groups = slices.into_iter().map(|(transforms, gate, rules)| Ok(RuleSlice { transforms, gate, rules: RuleGroup::build(rules)? })).collect::<anyhow::Result<Vec<_>>>()?;
             by_buffer.insert(key, BufferRules { groups });
         }
+        let xbits: FxHashMap<u32, crate::threshold::XbitSpec> = rules_xbits;
         let packet_rules = by_buffer.keys().any(|(b, _)| *b == Buffer::PacketPayload);
-        Ok(RuleSetV2 { by_buffer, count, flowbits, composites, thresholds, packet_rules })
+        Ok(RuleSetV2 { by_buffer, count, flowbits, composites, thresholds, packet_rules, xbits })
     }
 
     /// Evaluates every applicable rule against one buffer.
@@ -2366,7 +2734,7 @@ impl RuleSetV2 {
                     let c = &self.composites[cid as usize];
                     if bits.mark_part(cid, idx, c.parts, self.composites.len()) {
                         apply_effects(&c.effects, bits, registry_len);
-                        if !c.noalert {
+                        if !c.noalert || !c.xbits.is_empty() {
                             out.push(RuleHit { name: c.name.clone(), sid: c.sid, severity: c.severity });
                         }
                     }
@@ -2399,6 +2767,92 @@ impl RuleSetV2 {
                 let idx = scratch.candidates[i];
                 if evaluate_rule(&group.prefiltered[idx], p, evaluate, data, bits, out) {
                     pending.push(&group.prefiltered[idx]);
+                }
+            }
+        }
+        for rule in &group.always {
+            if evaluate_rule(rule, p, evaluate, data, bits, out) {
+                pending.push(rule);
+            }
+        }
+    }
+}
+
+impl RuleSetV2 {
+    /// As [`RuleSetV2::check`], for a buffer that only ever grows (the
+    /// reassembled stream), scanning just what is new. `direction` is a
+    /// concrete side, since a stream always has one.
+    #[allow(clippy::too_many_arguments)]
+    pub fn check_stream(&self, p: &Packet, buffer: Buffer, direction: Direction, data: &[u8], scan: &mut StreamScan, scratch: &mut MatchScratch, bits: Option<&mut FlowBits>, out: &mut Vec<RuleHit>) {
+        let Some(group) = self.by_buffer.get(&(buffer, direction)) else {
+            return;
+        };
+        let registry_len = self.flowbits.len();
+        let mut pending: Vec<&Rule> = Vec::new();
+        {
+            let state: Option<&FlowBits> = bits.as_deref();
+            for (i, slice) in group.groups.iter().enumerate() {
+                if !slice.gate.is_none_or(|bit| state.is_some_and(|b| b.is_set(bit))) {
+                    continue;
+                }
+                if !slice.transforms.is_empty() {
+                    // Rare on a raw stream; read it whole.
+                    let view = apply_transforms(&slice.transforms, data);
+                    self.run_group(&slice.rules, p, direction, &view, scratch, state, &mut pending, out);
+                    continue;
+                }
+                if scan.slices.len() <= i {
+                    scan.slices.resize_with(group.groups.len(), SliceScan::default);
+                }
+                self.run_group_stream(&slice.rules, p, direction, data, &mut scan.slices[i], state, &mut pending, out);
+            }
+        }
+        if let Some(bits) = bits {
+            for rule in pending {
+                rule.apply_flowbits(bits, registry_len);
+                if let Some((cid, idx)) = rule.part {
+                    let c = &self.composites[cid as usize];
+                    if bits.mark_part(cid, idx, c.parts, self.composites.len()) {
+                        apply_effects(&c.effects, bits, registry_len);
+                        if !c.noalert || !c.xbits.is_empty() {
+                            out.push(RuleHit { name: c.name.clone(), sid: c.sid, severity: c.severity });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_group_stream<'a>(&self, group: &'a RuleGroup, p: &Packet, evaluate: Direction, data: &[u8], scan: &mut SliceScan, bits: Option<&FlowBits>, pending: &mut Vec<&'a Rule>, out: &mut Vec<RuleHit>) {
+        if let (Some(ac), false) = (&group.prefilter, group.prefiltered.is_empty()) {
+            // A stream that shrank is a different stream: start again.
+            if scan.upto > data.len() {
+                *scan = SliceScan::default();
+            }
+            let words = group.prefiltered.len().div_ceil(64);
+            if scan.seen.len() != words {
+                scan.seen.clear();
+                scan.seen.resize(words, 0);
+                scan.hits.clear();
+                scan.upto = 0;
+            }
+            // Back up far enough that a literal spanning the old end and the
+            // new bytes is still found whole.
+            let start = scan.upto.saturating_sub(group.max_pattern.saturating_sub(1));
+            for m in ac.find_overlapping_iter(&data[start..]) {
+                let owner = group.pattern_owner[m.pattern().as_usize()];
+                let (w, b) = (owner / 64, owner % 64);
+                if scan.seen[w] & (1 << b) == 0 {
+                    scan.seen[w] |= 1 << b;
+                    scan.hits.push(owner as u32);
+                }
+            }
+            scan.upto = data.len();
+            for &idx in &scan.hits {
+                let rule = &group.prefiltered[idx as usize];
+                if evaluate_rule(rule, p, evaluate, data, bits, out) {
+                    pending.push(rule);
                 }
             }
         }
@@ -2882,6 +3336,14 @@ mod tests {
         let p = pkt(PROTO_TCP, [10, 0, 0, 1], 1234, [10, 0, 0, 2], 80);
         assert_eq!(hits(&set, &p, Buffer::Payload, Direction::ToServer, b"\xde\xadaB"), vec!["n"]);
         assert!(hits(&set, &p, Buffer::Payload, Direction::ToServer, b"\xdf\xadaB").is_empty(), "0xde is not 0xdf");
+    }
+
+    #[test]
+    fn a_rule_can_name_content_by_its_hash() {
+        let set = build(&[r#"rule sid:1; name:"known-page"; buffer:http.response_body; transform:sha1; content:"|a9 99 3e 36 47 06 81 6a ba 3e 25 71 78 50 c2 6c 9c d0 d8 9d|";"#]);
+        let p = pkt(PROTO_TCP, [10, 0, 0, 1], 1234, [10, 0, 0, 2], 80);
+        assert_eq!(hits(&set, &p, Buffer::HttpResponseBody, Direction::ToClient, b"abc"), vec!["known-page"]);
+        assert!(hits(&set, &p, Buffer::HttpResponseBody, Direction::ToClient, b"abd").is_empty());
     }
 
     /// A width of zero means "every digit there", for a field whose width
@@ -3390,6 +3852,130 @@ mod tests {
         assert_eq!(hits(&set, &p, Buffer::Payload, Direction::ToServer, b"xxxx"), vec!["big"]);
         p.payload_len = 4;
         assert!(hits(&set, &p, Buffer::Payload, Direction::ToServer, b"xxxx").is_empty(), "the packet is small, whatever the buffer holds");
+    }
+
+    fn tcp() -> Packet {
+        pkt(PROTO_TCP, [10, 0, 0, 1], 1234, [10, 0, 0, 2], 80)
+    }
+
+    /// The commonest use: a length field says how long the next field is.
+    #[test]
+    fn an_extracted_length_can_bound_the_next_content() {
+        let set = build(&[r#"rule sid:1; name:"len"; content:"|AA|"; byte_extract:1,0,n,relative; content:"END"; distance:0; within:n;"#]);
+        let p = tcp();
+        // After 0xAA comes a limit of 6, and END must end within 6 bytes of it.
+        assert_eq!(hits(&set, &p, Buffer::Payload, Direction::ToServer, b"\xAA\x06xxEND"), vec!["len"]);
+        assert!(hits(&set, &p, Buffer::Payload, Direction::ToServer, b"\xAA\x06xxxEND").is_empty(), "ends past the extracted limit");
+    }
+
+    #[test]
+    fn a_variable_can_be_the_value_of_a_byte_test() {
+        // The second byte must not equal the first: a rule about a repeated byte.
+        let set = build(&[r#"rule sid:1; name:"differs"; content:"|08|"; byte_extract:1,0,first,relative; byte_test:1,!=,first,1,relative;"#]);
+        let p = tcp();
+        assert_eq!(hits(&set, &p, Buffer::Payload, Direction::ToServer, b"\x08\x05\x06"), vec!["differs"]);
+        assert!(hits(&set, &p, Buffer::Payload, Direction::ToServer, b"\x08\x05\x05").is_empty());
+    }
+
+    #[test]
+    fn byte_math_computes_a_variable_and_isdataat_can_read_it() {
+        // "the record claims N bytes plus 2, and that much data is not there"
+        let set = build(&[r#"rule sid:1; name:"truncated"; content:"|A1|"; byte_math:bytes 1, offset 0, oper +, rvalue 2, result length, relative; isdataat:!length,relative;"#]);
+        let p = tcp();
+        assert_eq!(hits(&set, &p, Buffer::Payload, Direction::ToServer, b"\xA1\x03xxxx"), vec!["truncated"]);
+        assert!(hits(&set, &p, Buffer::Payload, Direction::ToServer, b"\xA1\x03xxxxxxxx").is_empty());
+    }
+
+    #[test]
+    fn using_a_variable_nothing_defined_is_an_error() {
+        assert!(parse_rule(r#"rule sid:1; name:"x"; content:"a"; content:"b"; within:nope;"#).is_err());
+        assert!(parse_rule(r#"rule sid:1; name:"x"; content:"a"; byte_test:1,>,nope,0;"#).is_err());
+    }
+
+    #[test]
+    fn an_unset_variable_means_the_term_did_not_match() {
+        // The extraction cannot read its byte, so its variable stays unset.
+        let set = build(&[r#"rule sid:1; name:"x"; content:"|AA|"; byte_extract:1,5,n,relative; content:"Z"; within:n;"#]);
+        assert!(hits(&set, &tcp(), Buffer::Payload, Direction::ToServer, b"\xAAZ").is_empty());
+    }
+
+    #[test]
+    fn base64_decoding_is_tolerant_and_stops_at_padding() {
+        assert_eq!(base64_decode(b"aGVsbG8="), b"hello");
+        assert_eq!(base64_decode(b"aGVs\r\nbG8="), b"hello", "line breaks are skipped");
+        assert_eq!(base64_decode(b"aGVsbG8"), b"hello", "missing padding is tolerated");
+        assert_eq!(base64_decode(b"aGVsbG8=trailing"), b"hello", "nothing after padding");
+        assert_eq!(base64_decode(b""), b"");
+        assert_eq!(base64_decode(b"++//"), vec![0xfb, 0xef, 0xff]);
+    }
+
+    #[test]
+    fn a_rule_can_match_inside_decoded_content() {
+        let set = build(&[r#"rule sid:1; name:"b64"; buffer:http.response_body; content:"data="; base64_decode:bytes 0,relative; content:"secret";"#]);
+        let p = tcp();
+        // "c2VjcmV0" is base64 for "secret".
+        assert_eq!(hits(&set, &p, Buffer::HttpResponseBody, Direction::ToClient, b"data=c2VjcmV0"), vec!["b64"]);
+        assert!(hits(&set, &p, Buffer::HttpResponseBody, Direction::ToClient, b"data=bm90aGluZw==").is_empty());
+        // The plain text is not enough: the term reads decoded bytes.
+        assert!(hits(&set, &p, Buffer::HttpResponseBody, Direction::ToClient, b"data=secret").is_empty());
+    }
+
+    /// The prefilter sees the raw buffer, so a literal that exists only
+    /// once decoded must not be used to key it.
+    #[test]
+    fn a_literal_after_a_decode_does_not_key_the_prefilter() {
+        let set = build(&[r#"rule sid:1; name:"b64"; buffer:http.response_body; base64_decode:bytes 0; content:"secret";"#]);
+        assert_eq!(hits(&set, &tcp(), Buffer::HttpResponseBody, Direction::ToClient, b"c2VjcmV0"), vec!["b64"]);
+    }
+
+    fn scan_all(set: &RuleSetV2, chunks: &[&[u8]]) -> Vec<String> {
+        let p = pkt(PROTO_TCP, [10, 0, 0, 1], 1234, [10, 0, 0, 2], 80);
+        let (mut scan, mut scratch, mut out) = (StreamScan::default(), MatchScratch::default(), Vec::new());
+        let mut stream = Vec::new();
+        for c in chunks {
+            stream.extend_from_slice(c);
+            set.check_stream(&p, Buffer::Payload, Direction::ToServer, &stream, &mut scan, &mut scratch, None, &mut out);
+        }
+        let mut names: Vec<String> = out.into_iter().map(|h| h.name).collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// The optimisation must not change the answer: any way of cutting a
+    /// stream into segments finds what scanning it whole finds.
+    #[test]
+    fn scanning_incrementally_finds_what_scanning_the_whole_stream_finds() {
+        let set = build(&[
+            r#"rule sid:1; name:"exact"; content:"NEEDLE";"#,
+            r#"rule sid:2; name:"nocase"; content:"secret"; nocase;"#,
+            r#"rule sid:3; name:"two"; content:"AAAA"; content:"BBBB"; distance:0;"#,
+        ]);
+        let whole: &[u8] = b"xx NEEDLE yy SeCrEt zz AAAA gap BBBB end";
+        let baseline = scan_all(&set, &[whole]);
+        assert_eq!(baseline, ["exact", "nocase", "two"]);
+        // Every possible cut into two, and one-byte-at-a-time.
+        for cut in 0..=whole.len() {
+            assert_eq!(scan_all(&set, &[&whole[..cut], &whole[cut..]]), baseline, "cut at {}", cut);
+        }
+        let bytes: Vec<&[u8]> = whole.chunks(1).collect();
+        assert_eq!(scan_all(&set, &bytes), baseline);
+    }
+
+    #[test]
+    fn a_literal_straddling_two_segments_is_found_by_the_overlap() {
+        let set = build(&[r#"rule sid:1; name:"straddle"; content:"ABCDEFGH";"#]);
+        assert_eq!(scan_all(&set, &[b"...ABCD", b"EFGH..."]), ["straddle"]);
+    }
+
+    #[test]
+    fn a_stream_that_shrinks_is_scanned_afresh() {
+        let set = build(&[r#"rule sid:1; name:"n"; content:"NEEDLE";"#]);
+        let p = pkt(PROTO_TCP, [10, 0, 0, 1], 1234, [10, 0, 0, 2], 80);
+        let (mut scan, mut scratch, mut out) = (StreamScan::default(), MatchScratch::default(), Vec::new());
+        set.check_stream(&p, Buffer::Payload, Direction::ToServer, b"aaaaaaaaaaaaaaaa", &mut scan, &mut scratch, None, &mut out);
+        set.check_stream(&p, Buffer::Payload, Direction::ToServer, b"NEEDLE", &mut scan, &mut scratch, None, &mut out);
+        assert_eq!(out.len(), 1);
     }
 
 }

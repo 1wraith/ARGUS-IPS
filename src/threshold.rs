@@ -132,6 +132,78 @@ impl Fields {
     }
 }
 
+/// What an `xbits` option does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum XbitVerb {
+    Set,
+    Unset,
+    Toggle,
+    IsSet,
+    IsNotSet,
+}
+
+/// One `xbits:<verb>,<name>,track <ip_src|ip_dst|ip_pair>[,expire <secs>]`.
+///
+/// State that outlives a connection and is keyed on an address: "this host
+/// asked an IP-check service a minute ago", so that a later, otherwise
+/// unremarkable connection from it means something. It cannot live on a
+/// flow, and it cannot live in a worker (the two connections may be on
+/// different ones), so like rate control it lives in the gate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct XbitOp {
+    pub verb: XbitVerb,
+    pub name: String,
+    pub track: Track,
+    pub expire_secs: u32,
+}
+
+/// How long a bit lasts when the rule does not say.
+const DEFAULT_XBIT_EXPIRE: u32 = 30;
+
+impl XbitOp {
+    pub fn parse(value: &str) -> anyhow::Result<XbitOp> {
+        let mut parts = value.split(',').map(str::trim);
+        let verb = match parts.next().unwrap_or("").to_ascii_lowercase().as_str() {
+            "set" => XbitVerb::Set,
+            "unset" => XbitVerb::Unset,
+            "toggle" => XbitVerb::Toggle,
+            "isset" => XbitVerb::IsSet,
+            "isnotset" => XbitVerb::IsNotSet,
+            other => anyhow::bail!("unknown xbits verb {:?}", other),
+        };
+        let name = parts.next().filter(|n| !n.is_empty()).ok_or_else(|| anyhow::anyhow!("xbits needs a name"))?.to_string();
+        let mut track = None;
+        let mut expire_secs = DEFAULT_XBIT_EXPIRE;
+        for p in parts {
+            let (k, v) = p.split_once(char::is_whitespace).map(|(k, v)| (k, v.trim())).unwrap_or((p, ""));
+            match k.to_ascii_lowercase().as_str() {
+                "track" => {
+                    track = Some(match v.to_ascii_lowercase().as_str() {
+                        "ip_src" => Track::Src,
+                        "ip_dst" => Track::Dst,
+                        "ip_pair" => Track::Pair,
+                        other => anyhow::bail!("unsupported xbits tracking {:?}", other),
+                    })
+                }
+                "expire" => {
+                    expire_secs = v.parse()?;
+                    anyhow::ensure!(expire_secs > 0, "xbits expire must be at least 1");
+                }
+                other => anyhow::bail!("unknown xbits field {:?}", other),
+            }
+        }
+        Ok(XbitOp { verb, name, track: track.ok_or_else(|| anyhow::anyhow!("xbits needs 'track'"))?, expire_secs })
+    }
+}
+
+/// A rule's cross-connection state operations.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct XbitSpec {
+    pub ops: Vec<XbitOp>,
+    /// The rule exists only to set state, so its match is not reported.
+    pub noalert: bool,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Key {
     Src(IpAddr),
@@ -156,6 +228,8 @@ const MAX_WINDOWS: usize = 200_000;
 pub struct Gate {
     windows: FxHashMap<(u32, Key), Window>,
     newest_ms: u64,
+    /// Bits that are set, and when each stops being.
+    bits: FxHashMap<(String, Key), u64>,
 }
 
 fn millis(t: SystemTime) -> u64 {
@@ -163,6 +237,59 @@ fn millis(t: SystemTime) -> u64 {
 }
 
 impl Gate {
+    fn bit_key(alert: &Alert, op: &XbitOp) -> (String, Key) {
+        let key = match op.track {
+            Track::Src => Key::Src(alert.src),
+            Track::Dst => Key::Dst(alert.dst),
+            Track::Pair => Key::Pair(alert.src, alert.dst),
+            Track::Rule => Key::Rule,
+        };
+        (op.name.clone(), key)
+    }
+
+    fn bit_is_set(&self, alert: &Alert, op: &XbitOp) -> bool {
+        let now = millis(alert.timestamp);
+        self.bits.get(&Gate::bit_key(alert, op)).is_some_and(|&until| now < until)
+    }
+
+    /// Whether every condition (`isset`, `isnotset`) of a rule holds.
+    pub fn xbits_hold(&self, alert: &Alert, spec: &XbitSpec) -> bool {
+        spec.ops.iter().all(|op| match op.verb {
+            XbitVerb::IsSet => self.bit_is_set(alert, op),
+            XbitVerb::IsNotSet => !self.bit_is_set(alert, op),
+            _ => true,
+        })
+    }
+
+    /// Applies a matching rule's effects (`set`, `unset`, `toggle`).
+    pub fn xbits_apply(&mut self, alert: &Alert, spec: &XbitSpec) {
+        let now = millis(alert.timestamp);
+        self.newest_ms = self.newest_ms.max(now);
+        if self.bits.len() >= MAX_WINDOWS {
+            let horizon = self.newest_ms;
+            self.bits.retain(|_, &mut until| until > horizon);
+        }
+        for op in &spec.ops {
+            let key = Gate::bit_key(alert, op);
+            match op.verb {
+                XbitVerb::Set => {
+                    self.bits.insert(key, now + op.expire_secs as u64 * 1000);
+                }
+                XbitVerb::Unset => {
+                    self.bits.remove(&key);
+                }
+                XbitVerb::Toggle => {
+                    if self.bit_is_set(alert, op) {
+                        self.bits.remove(&key);
+                    } else {
+                        self.bits.insert(key, now + op.expire_secs as u64 * 1000);
+                    }
+                }
+                XbitVerb::IsSet | XbitVerb::IsNotSet => {}
+            }
+        }
+    }
+
     /// Whether this alert is to be reported, counting it.
     pub fn admit(&mut self, alert: &Alert, rule: &Threshold) -> bool {
         let now = millis(alert.timestamp);
@@ -242,7 +369,19 @@ pub fn run_threshold_gate(
     let mut current = rules.load();
     let mut held: Vec<Alert> = Vec::new();
 
-    fn settle(gate: &mut Gate, stats: &mut GateStats, tx: &crossbeam_channel::Sender<Alert>, rule: Option<Threshold>, alert: Alert) {
+    fn settle(gate: &mut Gate, stats: &mut GateStats, tx: &crossbeam_channel::Sender<Alert>, rule: Option<Threshold>, bits: Option<XbitSpec>, alert: Alert) {
+        // State first: a rule whose conditions fail did not match, and one
+        // that matches has its effects whether or not it is then reported.
+        if let Some(spec) = &bits {
+            if !gate.xbits_hold(&alert, spec) {
+                stats.withheld += 1;
+                return;
+            }
+            gate.xbits_apply(&alert, spec);
+            if spec.noalert {
+                return;
+            }
+        }
         let admitted = rule.is_none_or(|t| gate.admit(&alert, &t));
         if admitted {
             stats.passed += 1;
@@ -259,26 +398,27 @@ pub fn run_threshold_gate(
             gate = Gate::default();
         }
         let rule = current.rules.threshold_for(alert.sid);
-        if rule.is_none() {
-            settle(&mut gate, &mut stats, &tx, None, alert);
+        let bits = current.rules.xbits_for(alert.sid);
+        if rule.is_none() && bits.is_none() {
+            settle(&mut gate, &mut stats, &tx, None, None, alert);
         } else if ordered {
             held.push(alert);
             if held.len() >= MAX_HELD {
                 eprintln!("argus: more than {} threshold-tracked alerts in one replay; counting holds within batches of that size only", MAX_HELD);
                 held.sort_unstable_by(order);
                 for a in held.drain(..) {
-                    let t = current.rules.threshold_for(a.sid);
-                    settle(&mut gate, &mut stats, &tx, t, a);
+                    let (t, b) = (current.rules.threshold_for(a.sid), current.rules.xbits_for(a.sid));
+                    settle(&mut gate, &mut stats, &tx, t, b, a);
                 }
             }
         } else {
-            settle(&mut gate, &mut stats, &tx, rule, alert);
+            settle(&mut gate, &mut stats, &tx, rule, bits, alert);
         }
     }
     held.sort_unstable_by(order);
     for a in held {
-        let t = current.rules.threshold_for(a.sid);
-        settle(&mut gate, &mut stats, &tx, t, a);
+        let (t, b) = (current.rules.threshold_for(a.sid), current.rules.xbits_for(a.sid));
+        settle(&mut gate, &mut stats, &tx, t, b, a);
     }
     stats
 }
@@ -437,6 +577,106 @@ mod tests {
         assert_eq!(through_the_gate(LIMIT_ONE, true, alerts.clone()), [(7, 0)]);
         // Live counting, by contrast, keeps whichever came first.
         assert_eq!(through_the_gate(LIMIT_ONE, false, alerts), [(7, 10)]);
+    }
+
+    fn spec(ops: &[&str], noalert: bool) -> XbitSpec {
+        XbitSpec { ops: ops.iter().map(|o| XbitOp::parse(o).unwrap()).collect(), noalert }
+    }
+
+    /// Applies a rule the way the gate does: conditions, then effects.
+    fn fire(gate: &mut Gate, a: &Alert, s: &XbitSpec) -> bool {
+        if !gate.xbits_hold(a, s) {
+            return false;
+        }
+        gate.xbits_apply(a, s);
+        true
+    }
+
+    #[test]
+    fn xbits_parse_their_forms() {
+        let op = XbitOp::parse("set,ET.ipcheck,track ip_src,expire 10").unwrap();
+        assert_eq!(op, XbitOp { verb: XbitVerb::Set, name: "ET.ipcheck".into(), track: Track::Src, expire_secs: 10 });
+        assert_eq!(XbitOp::parse("isset,a,track ip_pair").unwrap().expire_secs, 30, "the default lifetime");
+        assert!(XbitOp::parse("set,a").is_err(), "tracking is required");
+        assert!(XbitOp::parse("set,a,track flow").is_err());
+        assert!(XbitOp::parse("frob,a,track ip_src").is_err());
+    }
+
+    #[test]
+    fn a_bit_set_by_one_connection_is_seen_by_another_from_the_same_host() {
+        let mut gate = Gate::default();
+        let setter = spec(&["set,seen,track ip_src,expire 60"], true);
+        let reader = spec(&["isset,seen,track ip_src"], false);
+        assert!(!fire(&mut gate, &alert(2, 1, 9, 5), &reader), "nothing set yet");
+        assert!(fire(&mut gate, &alert(1, 1, 5, 10), &setter));
+        assert!(fire(&mut gate, &alert(2, 1, 9, 20), &reader), "same source, a different destination");
+        assert!(!fire(&mut gate, &alert(2, 3, 9, 21), &reader), "a different source");
+    }
+
+    #[test]
+    fn a_bit_lapses_after_its_expiry() {
+        let mut gate = Gate::default();
+        fire(&mut gate, &alert(1, 1, 5, 0), &spec(&["set,b,track ip_src,expire 10"], true));
+        let reader = spec(&["isset,b,track ip_src"], false);
+        assert!(fire(&mut gate, &alert(2, 1, 9, 9), &reader));
+        assert!(!fire(&mut gate, &alert(2, 1, 9, 11), &reader));
+    }
+
+    #[test]
+    fn unset_toggle_and_isnotset() {
+        let mut gate = Gate::default();
+        let a = alert(1, 1, 5, 0);
+        let not_set = spec(&["isnotset,b,track ip_src"], false);
+        assert!(fire(&mut gate, &a, &not_set));
+        fire(&mut gate, &a, &spec(&["toggle,b,track ip_src,expire 60"], true));
+        assert!(!fire(&mut gate, &a, &not_set), "toggled on");
+        fire(&mut gate, &a, &spec(&["toggle,b,track ip_src,expire 60"], true));
+        assert!(fire(&mut gate, &a, &not_set), "toggled off");
+        fire(&mut gate, &a, &spec(&["set,b,track ip_src"], true));
+        fire(&mut gate, &a, &spec(&["unset,b,track ip_src"], true));
+        assert!(fire(&mut gate, &a, &not_set));
+    }
+
+    #[test]
+    fn tracking_by_pair_distinguishes_destinations() {
+        let mut gate = Gate::default();
+        fire(&mut gate, &alert(1, 1, 5, 0), &spec(&["set,b,track ip_pair,expire 60"], true));
+        let reader = spec(&["isset,b,track ip_pair"], false);
+        assert!(fire(&mut gate, &alert(2, 1, 5, 1), &reader));
+        assert!(!fire(&mut gate, &alert(2, 1, 6, 1), &reader));
+    }
+
+    #[test]
+    fn different_names_do_not_interfere() {
+        let mut gate = Gate::default();
+        fire(&mut gate, &alert(1, 1, 5, 0), &spec(&["set,one,track ip_src"], true));
+        assert!(!fire(&mut gate, &alert(1, 1, 5, 1), &spec(&["isset,two,track ip_src"], false)));
+    }
+
+    const SETTER: &str = "rule sid:7; name:\"mark\"; content:\"a\"; xbits:set,seen,track ip_src,expire 60; noalert;\n";
+    const READER: &str = "rule sid:8; name:\"use\"; content:\"b\"; xbits:isset,seen,track ip_src;\n";
+
+    fn both(ordered: bool, alerts: Vec<Alert>) -> Vec<(u32, u64)> {
+        through_the_gate(&format!("{}{}", SETTER, READER), ordered, alerts)
+    }
+
+    #[test]
+    fn a_setter_is_never_reported_and_a_reader_needs_it() {
+        // The reader alone: nothing set, so it did not match.
+        assert!(both(false, vec![alert(8, 1, 5, 0)]).is_empty());
+        // Set, then read from the same source: only the reader is reported.
+        assert_eq!(both(false, vec![alert(7, 1, 5, 0), alert(8, 1, 9, 1)]), [(8, 1)]);
+    }
+
+    /// The reason the state lives here: in replay the two alerts may
+    /// reach the gate in either order, and the answer must not depend on it.
+    #[test]
+    fn replay_gives_the_same_answer_whatever_the_arrival_order() {
+        let forward = vec![alert(7, 1, 5, 0), alert(8, 1, 9, 1)];
+        let mut backward = forward.clone();
+        backward.reverse();
+        assert_eq!(both(true, forward), [(8, 1)]);
+        assert_eq!(both(true, backward), [(8, 1)]);
     }
 
 }

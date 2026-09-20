@@ -60,6 +60,10 @@ pub struct FileInfo {
     /// The type the content's own leading bytes say it is, when they say
     /// anything recognisable.
     pub kind: Option<&'static str>,
+    /// What libmagic would call it (`Zip archive data, ...`), for the
+    /// types worth naming. Rules written for Suricata's `file.magic`
+    /// match on these descriptions.
+    pub magic: Option<&'static str>,
 }
 
 /// Magic-number signatures, most specific first.
@@ -90,6 +94,91 @@ const MAGIC: &[(&[u8], &str)] = &[
     (b"\xff\xd8\xff", "jpeg"),
 ];
 
+/// libmagic-style descriptions: `(offset, signature, description)`.
+///
+/// A handful, chosen for the descriptions detection rules quote. The text
+/// is the front of what `file` prints, which is what a substring match
+/// (`content:"Zip archive"`) needs.
+const DESCRIPTIONS: &[(usize, &[u8], &str)] = &[
+    (0, b"PK\x03\x04", "Zip archive data, at least v2.0 to extract"),
+    (257, b"ustar\x00", "POSIX tar archive"),
+    (257, b"ustar  \x00", "POSIX tar archive (GNU)"),
+    (0, b"7z\xbc\xaf\x27\x1c", "7-zip archive data, version 0.4"),
+    (0, b"Rar!\x1a\x07", "RAR archive data"),
+    (0, b"\x1f\x8b", "gzip compressed data"),
+    (0, b"BZh", "bzip2 compressed data"),
+    (0, b"\xfd7zXZ", "XZ compressed data"),
+    (0, b"%PDF-", "PDF document"),
+    (0, b"\x7fELF", "ELF"),
+    (0, b"MZ", "PE32 executable"),
+    (0, b"\x89PNG", "PNG image data"),
+    (0, b"GIF8", "GIF image data"),
+    (0, b"\xff\xd8\xff", "JPEG image data"),
+];
+
+/// The libmagic-style description of content, from its leading bytes.
+pub fn describe(data: &[u8]) -> Option<&'static str> {
+    DESCRIPTIONS.iter().find(|(at, sig, _)| data.get(*at..).is_some_and(|rest| rest.starts_with(sig))).map(|(_, _, d)| *d)
+}
+
+/// SHA-1, for the rules that identify content by it. Not used for anything
+/// that needs to resist an attacker; it is the digest those rules name.
+pub fn sha1(data: &[u8]) -> [u8; 20] {
+    let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&((data.len() as u64) * 8).to_be_bytes());
+    for block in msg.chunks_exact(64) {
+        let mut w = [0u32; 80];
+        for (i, word) in block.chunks_exact(4).enumerate() {
+            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e] = h;
+        for (i, wi) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | (!b & d), 0x5A827999),
+                20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
+                _ => (b ^ c ^ d, 0xCA62C1D6),
+            };
+            let t = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(*wi);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = t;
+        }
+        for (slot, v) in h.iter_mut().zip([a, b, c, d, e]) {
+            *slot = slot.wrapping_add(v);
+        }
+    }
+    let mut out = [0u8; 20];
+    for (i, word) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+/// An MD5 as lower-case hex.
+pub fn md5_hex(data: &[u8]) -> String {
+    hex(&Md5::digest(data))
+}
+
+/// Raw MD5 and SHA-256 digests, for the same rules.
+pub fn md5_raw(data: &[u8]) -> Vec<u8> {
+    Md5::digest(data).to_vec()
+}
+
+pub fn sha256_raw(data: &[u8]) -> Vec<u8> {
+    Sha256::digest(data).to_vec()
+}
+
 /// Identifies content by its leading bytes.
 ///
 /// Extension-free and claim-free on purpose: a `Content-Type` header and
@@ -112,7 +201,7 @@ pub fn inspect(data: &[u8]) -> Option<FileInfo> {
     let md5 = hex(&Md5::digest(hashed));
     let sha256 = hex(&Sha256::digest(hashed));
 
-    Some(FileInfo { size: data.len(), md5, sha256, truncated, kind: identify(data) })
+    Some(FileInfo { size: data.len(), md5, sha256, truncated, kind: identify(data), magic: describe(data) })
 }
 
 /// How much of one transfer is hashed when streaming.
@@ -130,18 +219,21 @@ pub const MAX_STREAM_HASH: u64 = 64 * 1024 * 1024;
 /// the sensor into a memory exhaustion target. A running digest needs
 /// about two hundred bytes however large the file is, which is why file
 /// hashing is done this way rather than by inspecting a buffer.
+/// Leading bytes kept for typing: enough to reach a tar header's magic.
+const HEAD_BYTES: usize = 264;
+
 pub struct FileHasher {
     md5: Md5,
     sha256: Sha256,
     size: u64,
-    head: [u8; 16],
+    head: [u8; HEAD_BYTES],
     head_len: usize,
     truncated: bool,
 }
 
 impl Default for FileHasher {
     fn default() -> Self {
-        FileHasher { md5: Md5::new(), sha256: Sha256::new(), size: 0, head: [0; 16], head_len: 0, truncated: false }
+        FileHasher { md5: Md5::new(), sha256: Sha256::new(), size: 0, head: [0; HEAD_BYTES], head_len: 0, truncated: false }
     }
 }
 
@@ -179,6 +271,7 @@ impl FileHasher {
             sha256: hex(&self.sha256.finalize()),
             truncated: self.truncated || incomplete,
             kind: identify(&self.head[..self.head_len]),
+            magic: describe(&self.head[..self.head_len]),
         })
     }
 }
@@ -403,6 +496,29 @@ mod tests {
         let mut d = Dechunker::default();
         d.feed(b"zz\r\n", |_| panic!("no payload was delivered"));
         assert!(d.bad && d.done);
+    }
+
+    #[test]
+    fn sha1_matches_the_published_vectors() {
+        let hex_of = |d: [u8; 20]| d.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+        assert_eq!(hex_of(sha1(b"")), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+        assert_eq!(hex_of(sha1(b"abc")), "a9993e364706816aba3e25717850c26c9cd0d89d");
+        assert_eq!(hex_of(sha1(b"The quick brown fox jumps over the lazy dog")), "2fd4e1c67a2d28fced849ee1bb76e7391b93eb12");
+        // Across the 55/56/64-byte padding boundaries.
+        assert_eq!(hex_of(sha1(&[b'a'; 56])), "c2db330f6083854c99d4b5bfb6e8f29f201be699");
+        assert_eq!(hex_of(sha1(&[b'a'; 64])), "0098ba824b5c16427bd7a1122a5a442a25ec644d");
+        assert_eq!(hex_of(sha1(&[b'a'; 1000])), "291e9a6c66994949b57ba5e650361e98fc36b1ba");
+    }
+
+    #[test]
+    fn descriptions_name_the_types_rules_quote() {
+        assert!(describe(b"PK\x03\x04rest").unwrap().starts_with("Zip archive"));
+        let mut tar = vec![0u8; 300];
+        tar[257..263].copy_from_slice(b"ustar\x00");
+        assert!(describe(&tar).unwrap().starts_with("POSIX tar archive"));
+        assert!(describe(b"7z\xbc\xaf\x27\x1c\x00\x04").unwrap().starts_with("7-zip archive"));
+        assert_eq!(describe(b"plain text"), None);
+        assert_eq!(describe(&[0u8; 10]), None, "a short buffer is not a tar header");
     }
 
 }

@@ -17,3 +17,5 @@
 # Python
 __pycache__/
 *.pyc
+*.eve
+*.ndjson

@@ -69,6 +69,14 @@ pub enum Observation {
     /// minute even when they keep getting it wrong.
     AuthAttempt { ts_sec: i64, src: IpAddr, dst: IpAddr, dst_port: u16, service: &'static str },
 
+    /// How many packets one worker saw from a source in one second.
+    ///
+    /// Packets are sharded by host *pair*, so a source flooding several
+    /// destinations is split across workers and each sees a fraction of
+    /// it. Only the sum is the flood, so the workers report their
+    /// counts here and the sum is judged in one place.
+    Volume { ts_sec: i64, src: IpAddr, packets: u32 },
+
     /// The server *refused* a credential: an FTP 530, an SMTP 535, an HTTP
     /// 401, an SMB logon failure. `src` is the client that tried.
     ///
@@ -130,6 +138,7 @@ impl Observation {
         }
         match self {
             Observation::AuthAttempt { ts_sec, src, dst, dst_port, service } => (*ts_sec, 0, ip(src), ip(dst), *dst_port, 0, 0, service.as_bytes()),
+            Observation::Volume { ts_sec, src, packets } => (*ts_sec, 4, ip(src), ip(&IpAddr::UNSPECIFIED), 0, *packets as u64, 0, &[]),
             Observation::AuthFailure { ts_sec, src, dst, dst_port, service } => (*ts_sec, 1, ip(src), ip(dst), *dst_port, 0, 0, service.as_bytes()),
             Observation::Flow { ts_sec, src, dst, dst_port, bytes_out, bytes_in, answered } => {
                 (*ts_sec, 2, ip(src), ip(dst), *dst_port, *bytes_out, (bytes_in << 1) | *answered as u64, &[])
@@ -143,6 +152,7 @@ impl Observation {
             Observation::AuthAttempt { ts_sec, .. }
             | Observation::AuthFailure { ts_sec, .. }
             | Observation::Flow { ts_sec, .. }
+            | Observation::Volume { ts_sec, .. }
             | Observation::DnsQuery { ts_sec, .. } => *ts_sec,
         }
     }
@@ -226,6 +236,11 @@ pub struct BehaviorConfig {
     pub max_sources: usize,
     pub max_pairs: usize,
     pub max_dns_domains: usize,
+    /// The flood limit, judged on the sum across every worker: packets
+    /// from one source inside `flood_window_secs`.
+    pub flood_limit: u64,
+    pub flood_window_secs: i64,
+    pub flood_min_interval_secs: i64,
 }
 
 impl Default for BehaviorConfig {
@@ -249,6 +264,9 @@ impl Default for BehaviorConfig {
             max_sources: 16384,
             max_pairs: 65536,
             max_dns_domains: 16384,
+            flood_limit: 5000,
+            flood_window_secs: 10,
+            flood_min_interval_secs: 10,
         }
     }
 }
@@ -265,6 +283,9 @@ struct SrcState {
     bytes_out: RateWindow,
     bytes_in: RateWindow,
     scan_gate: AlertGate,
+    /// Packets from this source in the flood window, over all workers.
+    packets: RateWindow,
+    flood_gate: AlertGate,
     scan_any_gate: AlertGate,
     exfil_gate: AlertGate,
     ratio_gate: AlertGate,
@@ -359,10 +380,31 @@ impl BehaviorEngine {
                 }
                 self.on_flow(now_sec, *src, *dst, *dst_port, *bytes_out, *bytes_in, out)
             }
+            Observation::Volume { src, packets, .. } => self.on_volume(now_sec, *src, *packets, out),
             Observation::DnsQuery { src, dst, name, name_len, .. } => self.on_dns(now_sec, *src, *dst, &name[..*name_len as usize], out),
         }
 
         self.stats.alerts += (out.len() - before) as u64;
+    }
+
+    /// A worker's per-second packet count for one source.
+    fn on_volume(&mut self, now_sec: i64, src: IpAddr, packets: u32, out: &mut Vec<Alert>) {
+        let (limit, interval, window) = (self.cfg.flood_limit, self.cfg.flood_min_interval_secs, self.cfg.flood_window_secs.max(1));
+        let Some(s) = self.source(src, now_sec) else { return };
+        let total = s.packets.add(now_sec, packets as u64);
+        if total > limit && s.flood_gate.allow(now_sec, interval) {
+            out.push(Alert {
+                timestamp: to_time(now_sec),
+                severity: Severity::High,
+                category: "PACKET_FLOOD",
+                src,
+                dst: IpAddr::UNSPECIFIED,
+                proto: "IP",
+                port: 0,
+                message: format!("{} packets from this source in the last {}s across all destinations (limit {})", total, window, limit),
+                sid: 0,
+            });
+        }
     }
 
     /// Borrows (or creates) per-source state, refusing past the cap.
@@ -373,12 +415,15 @@ impl BehaviorEngine {
             return None;
         }
         let cap = self.cfg.max_pairs;
+        let cfg_flood_window = self.cfg.flood_window_secs.max(1);
         let s = self.sources.entry(src).or_insert_with(|| SrcState {
             unanswered_by_port: FxHashMap::default(),
             unanswered_any: WindowSet::new(cap),
             bytes_out: RateWindow::new(window),
             bytes_in: RateWindow::new(window),
             scan_gate: AlertGate::default(),
+            packets: RateWindow::new(cfg_flood_window),
+            flood_gate: AlertGate::default(),
             scan_any_gate: AlertGate::default(),
             exfil_gate: AlertGate::default(),
             ratio_gate: AlertGate::default(),
@@ -1294,6 +1339,45 @@ mod tests {
         let early = unanswered(100, v4(10, 0, 0, 1), v4(10, 0, 0, 2), 80);
         let late = unanswered(200, v4(10, 0, 0, 1), v4(10, 0, 0, 2), 80);
         assert_eq!(late.total_cmp(&early), std::cmp::Ordering::Greater);
+    }
+
+    /// The reason volume is judged here: no single worker sees enough.
+    #[test]
+    fn a_flood_split_across_workers_is_seen_as_one() {
+        let src = v4(198, 51, 100, 7);
+        let cfg = BehaviorConfig { flood_limit: 1000, flood_window_secs: 10, ..BehaviorConfig::default() };
+        let mut engine = BehaviorEngine::new(cfg);
+        let mut out = Vec::new();
+        // Four workers each saw 300 packets in the same second: 1,200 in all,
+        // and no worker's own count reaches the limit.
+        for _ in 0..4 {
+            engine.observe(&Observation::Volume { ts_sec: 5_000, src, packets: 300 }, &mut out);
+        }
+        assert_eq!(out.iter().filter(|a| a.category == "PACKET_FLOOD").count(), 1);
+    }
+
+    #[test]
+    fn volume_below_the_limit_is_not_a_flood_and_a_lull_resets_it() {
+        let src = v4(198, 51, 100, 7);
+        let cfg = BehaviorConfig { flood_limit: 1000, flood_window_secs: 10, ..BehaviorConfig::default() };
+        let mut engine = BehaviorEngine::new(cfg);
+        let mut out = Vec::new();
+        engine.observe(&Observation::Volume { ts_sec: 5_000, src, packets: 600 }, &mut out);
+        // Twenty seconds later the first count has left the window.
+        engine.observe(&Observation::Volume { ts_sec: 5_020, src, packets: 600 }, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn one_alert_per_interval_however_many_counts_arrive() {
+        let src = v4(198, 51, 100, 7);
+        let cfg = BehaviorConfig { flood_limit: 100, flood_window_secs: 10, flood_min_interval_secs: 10, ..BehaviorConfig::default() };
+        let mut engine = BehaviorEngine::new(cfg);
+        let mut out = Vec::new();
+        for s in 0..5 {
+            engine.observe(&Observation::Volume { ts_sec: 5_000 + s, src, packets: 500 }, &mut out);
+        }
+        assert_eq!(out.len(), 1);
     }
 
 }

@@ -349,9 +349,10 @@ class LengthTests(unittest.TestCase):
         self.assertIsNone(why)
         self.assertIn("isdataat:50", out)
 
-    def test_a_variable_in_isdataat_is_refused(self):
-        _, why = convert('content:"a"; isdataat:!length,relative;', proto="tcp")
-        self.assertEqual(why, "isdataat form")
+    def test_a_variable_in_isdataat_is_kept(self):
+        out, why = convert('content:"a"; isdataat:!length,relative;', proto="tcp")
+        self.assertIsNone(why)
+        self.assertIn("isdataat:!length,relative", out)
 
     def test_a_length_test_alone_is_not_a_rule(self):
         # Nothing says what to look for, so it would match every request of
@@ -423,8 +424,12 @@ class ByteOps(unittest.TestCase):
         for v in ("1,&,128,6,relative", "1,!&,128,0", "2,>,81,2,relative", "4,<=,400,0", "0,=,0,0,string,dec", "1,&,0x80,6,relative", "2,>,3,4,little"):
             self.assertEqual(S.normalise_byte_op(v), v, v)
 
-    def test_a_named_variable_is_refused_in_any_slot(self):
-        for v in ("1,>,kelihos.p,0", "1,>,len,0", "off,>,3,0"):
+    def test_a_named_variable_is_accepted_as_the_value_or_offset(self):
+        for v in ("1,>,kelihos.p,0", "1,>,len,0", "1,>,3,off"):
+            self.assertEqual(S.normalise_byte_op(v), v, v)
+
+    def test_the_width_and_operator_are_always_literal(self):
+        for v in ("off,>,3,0", "1,frob,3,0"):
             self.assertIsNone(S.normalise_byte_op(v), v)
 
     def test_byte_jump_takes_two_numbers_then_modifiers(self):
@@ -447,9 +452,10 @@ class RelativeWindows(unittest.TestCase):
         _, why = convert('http.uri; content:"a"; content:"b"; within:-3;')
         self.assertIsNotNone(why)
 
-    def test_a_variable_distance_is_still_refused(self):
-        _, why = convert('http.uri; content:"a"; content:"b"; distance:len;')
-        self.assertEqual(why, "'distance' is not a constant")
+    def test_a_variable_distance_is_kept(self):
+        out, why = convert('http.uri; content:"a"; content:"b"; distance:len;')
+        self.assertIsNone(why)
+        self.assertIn("distance:len", out)
 
     def test_a_leading_window_is_from_offset_to_within(self):
         # Measured from the start of the buffer, the window is [D, W]; the
@@ -531,6 +537,83 @@ class TwoLineRules(unittest.TestCase):
         out, why = S.convert(self.rule("dns any any -> any 53", 'flow:to_server; content:"|01 00|";'), "")
         self.assertIsNone(why)
         self.assertEqual(len(out.splitlines()), 1)
+
+
+class Variables(unittest.TestCase):
+    def test_byte_extract_and_a_variable_window(self):
+        out, why = convert('content:"|AA|"; byte_extract:1,0,len,relative; content:"END"; distance:0; within:len;', proto="tcp")
+        self.assertIsNone(why)
+        self.assertIn("byte_extract:1,0,len,relative", out)
+        self.assertIn("within:len", out)
+
+    def test_a_variable_as_a_byte_test_value(self):
+        out, why = convert('content:"|08|"; byte_extract:1,0,Carbanak.Pivot,relative; byte_test:1,!=,Carbanak.Pivot,0,relative;', proto="tcp")
+        self.assertIsNone(why)
+        self.assertIn("byte_test:1,!=,Carbanak.Pivot,0,relative", out)
+
+    def test_byte_math_and_isdataat_on_its_result(self):
+        out, why = convert('content:"|a1|"; byte_math:bytes 4, offset 0, oper +, rvalue 6, result length, relative; isdataat:!length;', proto="tcp")
+        self.assertIsNone(why)
+        self.assertIn("byte_math:bytes 4,offset 0,oper +,rvalue 6,result length,relative", out)
+        self.assertIn("isdataat:!length", out)
+
+    def test_a_byte_extract_with_no_name_is_refused(self):
+        _, why = convert('content:"a"; byte_extract:1,0;', proto="tcp")
+        self.assertEqual(why, "'byte_extract' form")
+
+    def test_a_variable_in_a_leading_window_is_refused(self):
+        _, why = convert('http.uri; content:"/a"; http.header; content:"b"; distance:len;')
+        self.assertEqual(why, "a variable in a leading window")
+
+
+class Base64(unittest.TestCase):
+    def test_decode_then_match_on_the_decoded_bytes(self):
+        out, why = convert('http.response_body; content:"data="; base64_decode:bytes 250, offset 0, relative; base64_data; content:"secret";')
+        self.assertIsNone(why)
+        body = out.split("buffer:http.response_body")[1]
+        self.assertIn("base64_decode:bytes 250,offset 0,relative", body)
+        self.assertLess(body.index("base64_decode"), body.rindex('content:"secret"'))
+        self.assertNotIn("base64_data", out)
+
+
+class CrossConnection(unittest.TestCase):
+    def test_xbits_pass_through_normalised(self):
+        out, why = convert('tls.sni; content:"myip.com"; xbits:set, ET.ipcheck, track ip_src, expire 10; noalert;')
+        self.assertIsNone(why)
+        self.assertIn("xbits:set,ET.ipcheck,track ip_src,expire 10", out)
+
+    def test_a_reader_and_hostbits(self):
+        out, why = convert('content:"x"; hostbits:isset,seen,track ip_dst;', proto="tcp")
+        self.assertIsNone(why)
+        self.assertIn("xbits:isset,seen,track ip_dst", out)
+
+    def test_an_unsupported_tracking_is_refused(self):
+        _, why = convert('content:"x"; xbits:set,a,track ip_flow;', proto="tcp")
+        self.assertEqual(why, "'xbits' form")
+
+
+class ServerSide(unittest.TestCase):
+    def test_ja3s_is_a_buffer(self):
+        out, why = convert('flow:established,to_client; ja3s.hash; content:"f6dfdd25d1522e4e1c7cd09bd37ce619";', proto="tls")
+        self.assertIsNone(why)
+        self.assertIn("buffer:tls.ja3s", out)
+
+    def test_tls_version_is_an_exact_test_and_does_not_take_over_the_buffer(self):
+        out, why = convert('flow:established,to_client; tls.version:1.2; content:"|00 16|";', proto="tcp")
+        self.assertIsNone(why)
+        self.assertIn("buffer:tls.version", out)
+        self.assertIn('content:"1.2"', out)
+        self.assertIn("bsize:3", out)
+        # The payload content that follows still reads the payload.
+        self.assertIn("buffer:payload", out)
+
+    def test_a_hash_transform_and_file_magic(self):
+        out, why = convert('http.response_body; to_sha1; content:"|78 94|";')
+        self.assertIsNone(why)
+        self.assertIn("transform:sha1", out)
+        out, why = convert('file.magic; content:"Zip archive"; file.data; content:"x";')
+        self.assertIsNone(why)
+        self.assertIn("buffer:file.magic", out)
 
 
 class Transforms(unittest.TestCase):
@@ -632,11 +715,17 @@ class Loadable(unittest.TestCase):
             'content:"abc"; threshold:type both, track by_dst, count 5, seconds 30;',
             'http.uri; content:"/a"; http.host; content:"h"; detection_filter:track by_src, count 3, seconds 10;',
             'http.uri; content:"x"; content:"abc"; offset:2; endswith;',
+            'http.response_body; content:"data="; base64_decode:bytes 250, offset 0, relative; base64_data; content:"secret";',
+            'http.uri; content:"x"; xbits:set,ET.a,track ip_src,expire 10; noalert;',
+            'ja3s.hash; content:"f6dfdd25d1522e4e1c7cd09bd37ce619";',
+            'http.response_body; to_sha1; content:"|a9 99 3e 36 47 06 81 6a ba 3e 25 71 78 50 c2 6c 9c d0 d8 9d|";',
         )
         # dsize and isdataat on the raw payload are transport rules, not
         # application-layer ones.
         self.check('dsize:>20; content:"|de ad be ef|";', 'content:"KEY="; isdataat:!4,relative;', 'content:"a"; byte_test:1,!&,128,6,relative;', proto="tcp")
         self.check('content:"|03 00|";', proto="rdp")
+        self.check('content:"|AA|"; byte_extract:1,0,n,relative; content:"END"; distance:0; within:n;', 'content:"|a1|"; byte_math:bytes 1, offset 0, oper +, rvalue 2, result length, relative; isdataat:!length,relative;', proto="tcp")
+        self.check('flow:to_client; tls.version:1.2; content:"|00 16|";', proto="tcp")
         self.check('flow:to_server; content:"|01 00|";', proto="dns")
 
 

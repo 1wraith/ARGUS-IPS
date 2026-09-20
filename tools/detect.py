@@ -542,6 +542,17 @@ def e_overlapped_pending_segment(cap):
     cap.add(tcp(ATTACKER, VICTIM, 49102, 80, 2001, 6001, PSH | ACK, req[:cut]), 0.001)
 
 
+def e_spread_flood(cap):
+    """A flood spread over 60 destinations.
+
+    Packets are sharded by host pair, so the destinations land on different
+    workers and none of them sees more than a fraction of the volume. Only
+    the total, judged across workers, crosses the limit."""
+    for i in range(12000):
+        dst = ip4("10.9.0.%d" % (10 + i % 60))
+        cap.add(tcp(ATTACKER, dst, 50000, 80, i, 1, ACK, b"x" * 100), 10.0 / 12000)
+
+
 def e_slow_port_scan(cap):
     """A scan paced to stay under a 10-second window."""
     # 40 ports at 3s apart spans two minutes: invisible to the default
@@ -614,6 +625,7 @@ EVASIONS = [
     ("out_of_order_signature", e_out_of_order_signature, "SIGNATURE_MATCH", "segments delivered in reverse"),
     ("fragmented_signature", e_fragmented_signature, "SIGNATURE_MATCH", "DNS question split across IP fragments"),
     ("overlapped_pending", e_overlapped_pending_segment, "SIGNATURE_MATCH", "held segment overlapped by the one that fills the gap"),
+    ("spread_flood", e_spread_flood, "PACKET_FLOOD", "1200pps split across 60 destinations, and so across workers"),
     ("slow_port_scan", e_slow_port_scan, "PORT_SCAN", "40 ports at 3s intervals"),
     ("jittered_beacon", e_jittered_beacon, "BEACONING", "60s beacon with 12% jitter"),
     ("split_response", e_split_response, "SIGNATURE_MATCH", "response delivered one byte per segment"),

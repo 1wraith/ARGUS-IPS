@@ -605,6 +605,7 @@ pub enum Buffer {
     FileMd5,
     FileSha256,
     FileType,
+    FileMagic,
     DnsQuery,
     TlsSni,
     TlsJa3,
@@ -612,6 +613,8 @@ pub enum Buffer {
     TlsCertIssuer,
     TlsCertSerial,
     TlsCerts,
+    TlsJa3s,
+    TlsVersion,
     FtpCommand,
     SshVersion,
     SmtpCommand,
@@ -649,7 +652,7 @@ impl Buffer {
     pub fn side(self) -> Option<Direction> {
         match self {
             Buffer::HttpMethod | Buffer::HttpUri | Buffer::HttpHost | Buffer::HttpUserAgent | Buffer::HttpRequestBody | Buffer::HttpRequestLine | Buffer::HttpAccept | Buffer::HttpReferer | Buffer::HttpAcceptEnc | Buffer::HttpAcceptLang => Some(Direction::ToServer),
-            Buffer::HttpStatCode | Buffer::HttpStatMsg | Buffer::HttpResponseBody | Buffer::HttpServer | Buffer::HttpLocation | Buffer::HttpResponseLine | Buffer::TlsCertSubject | Buffer::TlsCertIssuer | Buffer::TlsCertSerial | Buffer::TlsCerts => Some(Direction::ToClient),
+            Buffer::HttpStatCode | Buffer::HttpStatMsg | Buffer::HttpResponseBody | Buffer::HttpServer | Buffer::HttpLocation | Buffer::HttpResponseLine | Buffer::TlsCertSubject | Buffer::TlsCertIssuer | Buffer::TlsCertSerial | Buffer::TlsCerts | Buffer::TlsJa3s | Buffer::TlsVersion => Some(Direction::ToClient),
             _ => None,
         }
     }
@@ -699,6 +702,7 @@ impl Buffer {
         // What the content's own leading bytes say it is, which is not
         // what its name or its Content-Type claim.
         ("file.type", Buffer::FileType),
+        ("file.magic", Buffer::FileMagic),
         ("smb.share", Buffer::SmbShare),
         ("ntlm.user", Buffer::NtlmUser),
         ("ntlm.domain", Buffer::NtlmDomain),
@@ -715,6 +719,8 @@ impl Buffer {
         ("tls.cert_issuer", Buffer::TlsCertIssuer),
         ("tls.cert_serial", Buffer::TlsCertSerial),
         ("tls.certs", Buffer::TlsCerts),
+        ("tls.ja3s", Buffer::TlsJa3s),
+        ("tls.version", Buffer::TlsVersion),
         ("ftp.command", Buffer::FtpCommand),
         ("ssh.version", Buffer::SshVersion),
         ("smtp.command", Buffer::SmtpCommand),
@@ -789,13 +795,18 @@ impl RuleSet {
     /// rule could use the result — the same reasoning as `record_flows`,
     /// and the same shape: work that nothing consumes is not done.
     pub fn wants_file_identity(&self) -> bool {
-        self.wants(&[Buffer::FileMd5, Buffer::FileSha256, Buffer::FileType])
+        self.wants(&[Buffer::FileMd5, Buffer::FileSha256, Buffer::FileType, Buffer::FileMagic])
     }
 
     /// Whether any loaded rule is about a single packet, which costs a
     /// scan of every packet's payload and so is done only when asked for.
     pub fn wants_packet_rules(&self) -> bool {
         self.v2.has_packet_rules()
+    }
+
+    /// Whether any loaded rule reads the server's ServerHello.
+    pub fn wants_server_hello(&self) -> bool {
+        self.wants(&[Buffer::TlsJa3s, Buffer::TlsVersion])
     }
 
     /// Whether any loaded rule inspects the server's certificate. Reading
@@ -816,6 +827,11 @@ impl RuleSet {
     /// are about a protocol rather than a buffer.
     pub fn mark_app(&self, bits: &mut crate::rules::FlowBits, app: &str) {
         self.v2.mark_app(bits, app);
+    }
+
+    /// The cross-connection state operations of a rule, if it has any.
+    pub fn xbits_for(&self, sid: u32) -> Option<crate::threshold::XbitSpec> {
+        self.v2.xbits_for(sid)
     }
 
     /// The rate control on a rule, if it has any. Only v2 rules can.
@@ -1031,6 +1047,28 @@ impl RuleSet {
     /// The actual single-keyed-lookup check — both the literal and regex
     /// paths are one hashmap lookup keyed on `(buffer, direction)`,
     /// `direction` always a concrete `ToServer`/`ToClient` here.
+    #[allow(clippy::too_many_arguments)]
+    /// As `check` for the raw stream of one side of a connection, which only
+    /// grows, so what was already scanned is not scanned again.
+    #[allow(clippy::too_many_arguments)]
+    pub fn check_stream(&self, p: &Packet, direction: Direction, data: &[u8], scan: &mut crate::rules::StreamScan, scratch: &mut MatchScratch, bits: Option<&mut FlowBits>, out: &mut Vec<RuleHit>) {
+        if let Some((ac, names)) = self.literal.get(&(Buffer::Payload, direction)) {
+            if let Some(m) = ac.find(data) {
+                out.push(RuleHit { name: names[m.pattern().as_usize()].clone(), sid: 0, severity: Severity::High });
+            }
+        }
+        if let Some(entries) = self.regex.get(&(Buffer::Payload, direction)) {
+            for entry in entries {
+                if entry.re.is_match(data) != entry.negate {
+                    out.push(RuleHit { name: entry.name.clone(), sid: 0, severity: Severity::High });
+                }
+            }
+        }
+        if !self.v2.is_empty() {
+            self.v2.check_stream(p, Buffer::Payload, direction, data, scan, scratch, bits, out);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn check_one(&self, p: &Packet, buffer: Buffer, lookup: Direction, evaluate: Direction, data: &[u8], scratch: &mut MatchScratch, bits: Option<&mut FlowBits>, out: &mut Vec<RuleHit>) {
         let direction = lookup;
@@ -2251,6 +2289,12 @@ impl SignatureEngine {
         self.rules.check(p, buffer, direction, data, scratch, bits, out);
     }
 
+    /// The raw stream, scanned incrementally; see [`crate::rules::StreamScan`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn check_stream_into(&self, p: &Packet, direction: Direction, data: &[u8], scan: &mut crate::rules::StreamScan, scratch: &mut MatchScratch, bits: Option<&mut FlowBits>, out: &mut Vec<RuleHit>) {
+        self.rules.check_stream(p, direction, data, scan, scratch, bits, out);
+    }
+
     /// Allocating convenience form, for tests and one-off callers.
     #[inline]
     pub fn check_buffer(&self, p: &Packet, buffer: Buffer, direction: Direction, data: &[u8]) -> Vec<RuleHit> {
@@ -2282,6 +2326,10 @@ pub struct AnomalyConfig {
     /// is a trap regardless of where the numbers are set; a rate doesn't
     /// move when the window does.
     pub packet_rate_pps: u32,
+    /// Report per-second packet counts to the aggregator instead of judging
+    /// the flood here. A worker only sees the destinations sharded to it,
+    /// so its own count is a fraction of a source that floods several.
+    pub flood_via_observations: bool,
     pub port_scan_limit: usize,
     /// Hard cap on tracked source addresses, per worker.
     ///
@@ -2327,6 +2375,7 @@ impl Default for AnomalyConfig {
             // been tried against synthetic captures. 500 per second
             // still catches anything worth the name.
             packet_rate_pps: 500,
+            flood_via_observations: false,
             port_scan_limit: 20,
             // 65536 sources x ~400 bytes is roughly 25MB per worker,
             // which is a real bound rather than a comfortable one, and
@@ -2387,6 +2436,9 @@ struct SrcStats {
     /// source regardless of destination — and `Option` for the same
     /// overflow reason.
     last_flood_alert_at: Option<i64>,
+    /// Packets counted in `vol_sec` and not yet reported to the aggregator.
+    vol_sec: i64,
+    vol_count: u32,
 }
 
 /// Recognizes whether an inbound UDP packet is a *reply* to something
@@ -2473,6 +2525,11 @@ pub struct AnomalyEngine {
     cfg: AnomalyConfig,
     /// `cfg.packet_rate_pps * window`, precomputed.
     flood_limit: u32,
+    /// Sources with packets counted but not yet reported, and the newest
+    /// second this engine has seen.
+    volume_active: Vec<IpAddr>,
+    latest_sec: i64,
+    flushed_sec: i64,
     num_buckets: i64,
     stats: FxHashMap<IpAddr, SrcStats>,
     udp_tracker: UdpPairTracker,
@@ -2499,6 +2556,9 @@ impl AnomalyEngine {
         AnomalyEngine {
             cfg,
             flood_limit,
+            volume_active: Vec::new(),
+            latest_sec: 0,
+            flushed_sec: 0,
             num_buckets,
             stats: FxHashMap::default(),
             udp_tracker: UdpPairTracker::new(cfg.max_udp_pairs),
@@ -2514,7 +2574,34 @@ impl AnomalyEngine {
     }
 
     pub fn take_observations(&mut self, out: &mut Vec<crate::behavior::Observation>) {
+        // Once a second, report the counts of every second that has ended,
+        // including for a source that has since gone quiet: a burst is
+        // exactly the thing that stops.
+        if self.cfg.flood_via_observations && self.latest_sec != self.flushed_sec {
+            self.flushed_sec = self.latest_sec;
+            self.flush_volume(false);
+        }
         out.append(&mut self.observations);
+    }
+
+    /// Reports counted packets. `all` includes the second still in progress,
+    /// which is what shutdown wants.
+    pub fn flush_volume(&mut self, all: bool) {
+        let latest = self.latest_sec;
+        let mut still: Vec<IpAddr> = Vec::new();
+        for src in std::mem::take(&mut self.volume_active) {
+            let Some(st) = self.stats.get_mut(&src) else { continue };
+            if st.vol_count == 0 {
+                continue;
+            }
+            if all || st.vol_sec < latest {
+                self.observations.push(crate::behavior::Observation::Volume { ts_sec: st.vol_sec, src, packets: st.vol_count });
+                st.vol_count = 0;
+            } else {
+                still.push(src);
+            }
+        }
+        self.volume_active = still;
     }
 
     pub fn limit_stats(&self) -> AnomalyLimitStats {
@@ -2562,6 +2649,8 @@ impl AnomalyEngine {
             dst_ports: FxHashMap::default(),
             last_seen_at: now_sec,
             last_flood_alert_at: None,
+            vol_sec: now_sec,
+            vol_count: 0,
         });
         st.last_seen_at = now_sec;
 
@@ -2581,7 +2670,19 @@ impl AnomalyEngine {
         // source. Previously this pushed an alert for every packet over
         // threshold and let the writer discard them, which meant peak
         // alert-channel pressure coincided exactly with peak traffic.
-        let flood_gated = st.last_flood_alert_at.is_some_and(|t| now_sec.saturating_sub(t) < self.cfg.alert_min_interval_secs);
+        if self.cfg.flood_via_observations {
+            if st.vol_count > 0 && st.vol_sec != now_sec {
+                self.observations.push(crate::behavior::Observation::Volume { ts_sec: st.vol_sec, src: p.src, packets: st.vol_count });
+                st.vol_count = 0;
+            }
+            if st.vol_count == 0 {
+                self.volume_active.push(p.src);
+            }
+            st.vol_sec = now_sec;
+            st.vol_count = st.vol_count.saturating_add(1);
+            self.latest_sec = self.latest_sec.max(now_sec);
+        }
+        let flood_gated = self.cfg.flood_via_observations || st.last_flood_alert_at.is_some_and(|t| now_sec.saturating_sub(t) < self.cfg.alert_min_interval_secs);
         if total > self.flood_limit && !flood_gated {
             st.last_flood_alert_at = Some(now_sec);
             out.push(Alert {
@@ -2864,6 +2965,9 @@ struct StreamHalf {
     scanned_http: bool,
     scanned_tls: bool,
     scanned_certs: bool,
+    scanned_server_hello: bool,
+    /// What the raw-payload prefilter has already seen of this stream.
+    payload_scan: crate::rules::StreamScan,
     scanned_ssh: bool,
     scanned_rdp: bool,
     /// One flag per enterprise protocol, latched on the first successful
@@ -2930,6 +3034,8 @@ impl StreamHalf {
             scanned_http: false,
             scanned_tls: false,
             scanned_certs: false,
+            scanned_server_hello: false,
+            payload_scan: Default::default(),
             scanned_smb1: false,
             scanned_ntlm: false,
             scanned_krb: false,
@@ -3897,6 +4003,9 @@ impl FlowTable {
                                 if let Some(kind) = f.kind {
                                     check_and_alert(sig, Buffer::FileType, direction, kind.as_bytes(), p, now, &mut half.matched, scratch, Some(flow_bits), out);
                                 }
+                                if let Some(magic) = f.magic {
+                                    check_and_alert(sig, Buffer::FileMagic, direction, magic.as_bytes(), p, now, &mut half.matched, scratch, Some(flow_bits), out);
+                                }
                                 seen_file = Some(f);
                             }
                         }
@@ -4011,6 +4120,18 @@ impl FlowTable {
                     }
                 } else if half.buffer.len() >= half.stream_cap {
                     half.scanned_tls = true;
+                }
+            }
+            // The server's chosen version and fingerprint, likewise from the
+            // other half, and available even where the certificate is not.
+            if direction == Direction::ToClient && !half.scanned_server_hello && sig.rules.wants_server_hello() {
+                if let Some(hello) = crate::tlscert::server_hello(&half.buffer) {
+                    half.scanned_server_hello = true;
+                    let m = &mut half.matched;
+                    check_and_alert(sig, Buffer::TlsVersion, direction, hello.version.as_bytes(), p, now, m, scratch, Some(flow_bits), out);
+                    check_and_alert(sig, Buffer::TlsJa3s, direction, hello.ja3s.as_bytes(), p, now, m, scratch, Some(flow_bits), out);
+                } else if half.buffer.len() >= half.stream_cap {
+                    half.scanned_server_hello = true;
                 }
             }
             // The server's certificate, which is on the other half of the
@@ -4294,7 +4415,7 @@ impl FlowTable {
             // buffer* on every new segment, not just the newest packet in
             // isolation — this is what actually defeats an attacker
             // splitting a signature across two packets.
-            check_and_alert(sig, Buffer::Payload, direction, &half.buffer, p, now, &mut half.matched, scratch, Some(flow_bits), out);
+            check_stream_and_alert(sig, direction, &half.buffer, &mut half.payload_scan, p, now, &mut half.matched, scratch, Some(flow_bits), out);
 
             // The stream-half borrow ends here, so the flow-level record
             // fields can be filled in. First value wins for each: a
@@ -4647,9 +4768,36 @@ fn report_file(
     check_and_alert(sig, Buffer::FileMd5, direction, f.md5.as_bytes(), p, now, matched, scratch, bits.as_deref_mut(), out);
     check_and_alert(sig, Buffer::FileSha256, direction, f.sha256.as_bytes(), p, now, matched, scratch, bits.as_deref_mut(), out);
     if let Some(kind) = f.kind {
-        check_and_alert(sig, Buffer::FileType, direction, kind.as_bytes(), p, now, matched, scratch, bits, out);
+        check_and_alert(sig, Buffer::FileType, direction, kind.as_bytes(), p, now, matched, scratch, bits.as_deref_mut(), out);
+    }
+    if let Some(magic) = f.magic {
+        check_and_alert(sig, Buffer::FileMagic, direction, magic.as_bytes(), p, now, matched, scratch, bits, out);
     }
     f
+}
+
+/// As [`check_and_alert`], for the raw stream.
+#[allow(clippy::too_many_arguments)]
+fn check_stream_and_alert(
+    sig: &SignatureEngine,
+    direction: Direction,
+    data: &[u8],
+    scan: &mut crate::rules::StreamScan,
+    p: &Packet,
+    now: SystemTime,
+    matched: &mut FxHashSet<String>,
+    scratch: &mut ScanScratch,
+    bits: Option<&mut FlowBits>,
+    out: &mut Vec<Alert>,
+) {
+    scratch.hits.clear();
+    sig.check_stream_into(p, direction, data, scan, &mut scratch.matcher, bits, &mut scratch.hits);
+    for hit in scratch.hits.drain(..) {
+        let key = format!("{}|{}", hit.sid, hit.name);
+        if matched.insert(key) {
+            out.push(signature_alert(p, Buffer::Payload, &hit, now));
+        }
+    }
 }
 
 fn check_and_alert(
@@ -5772,6 +5920,51 @@ mod signature_and_anomaly_tests {
             ae.observe(&pkt, now, &mut last_alerts);
         }
         assert!(last_alerts.iter().any(|a| a.category == "PACKET_FLOOD"));
+    }
+
+    /// With the aggregator in charge, a worker reports how many packets it
+    /// saw each second instead of judging them, and says nothing itself.
+    #[test]
+    fn a_worker_reports_per_second_counts_when_the_aggregator_judges_the_flood() {
+        let mut ae = AnomalyEngine::new(AnomalyConfig { flood_via_observations: true, ..test_cfg(5, 1, 100_000) });
+        let pkt = parse(&build_tcp_frame([10, 0, 0, 5], [10, 0, 0, 1], 51234, 80, 1, TCP_ACK, &[]));
+        let (t0, t1) = (UNIX_EPOCH + Duration::from_secs(1_700_000_000), UNIX_EPOCH + Duration::from_secs(1_700_000_001));
+        let mut alerts = Vec::new();
+        for _ in 0..10 {
+            ae.observe(&pkt, t0, &mut alerts);
+        }
+        for _ in 0..4 {
+            ae.observe(&pkt, t1, &mut alerts);
+        }
+        assert!(alerts.iter().all(|a| a.category != "PACKET_FLOOD"), "the worker does not judge it");
+        let mut obs = Vec::new();
+        ae.take_observations(&mut obs);
+        let counts: Vec<u32> = obs.iter().filter_map(|o| if let crate::behavior::Observation::Volume { packets, .. } = o { Some(*packets) } else { None }).collect();
+        assert_eq!(counts, [10], "the finished second, and not the one still counting");
+        // Shutdown reports what is left.
+        ae.flush_volume(true);
+        obs.clear();
+        ae.take_observations(&mut obs);
+        assert!(obs.iter().any(|o| matches!(o, crate::behavior::Observation::Volume { packets: 4, .. })));
+    }
+
+    /// A burst that then stops is the thing most worth reporting, and no
+    /// later packet from that source will ever push it out.
+    #[test]
+    fn a_burst_from_a_source_that_then_goes_quiet_is_still_reported() {
+        let mut ae = AnomalyEngine::new(AnomalyConfig { flood_via_observations: true, ..test_cfg(5, 1, 100_000) });
+        let burst = parse(&build_tcp_frame([10, 0, 0, 5], [10, 0, 0, 1], 51234, 80, 1, TCP_ACK, &[]));
+        let other = parse(&build_tcp_frame([10, 0, 0, 9], [10, 0, 0, 1], 51234, 80, 1, TCP_ACK, &[]));
+        let mut alerts = Vec::new();
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        for _ in 0..50 {
+            ae.observe(&burst, t0, &mut alerts);
+        }
+        // Another source's traffic, later, moves time on. The first never speaks again.
+        ae.observe(&other, t0 + Duration::from_secs(2), &mut alerts);
+        let mut obs = Vec::new();
+        ae.take_observations(&mut obs);
+        assert!(obs.iter().any(|o| matches!(o, crate::behavior::Observation::Volume { packets: 50, .. })), "{:?}", obs.len());
     }
 
     /// The regression this rename exists for: a CDN download that is fine
