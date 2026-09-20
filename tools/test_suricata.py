@@ -616,6 +616,34 @@ class ServerSide(unittest.TestCase):
         self.assertIn("buffer:file.magic", out)
 
 
+class HomeNetDefault(unittest.TestCase):
+    """Without a home network $EXTERNAL_NET means "any", and a rule about
+    traffic from outside fires on the sensor's own machines."""
+
+    def run_translator(self, *extra):
+
+        rule = 'alert udp $EXTERNAL_NET any -> $HOME_NET 1900 (msg:"t"; content:"NOTIFY"; sid:1; rev:1;)\n'
+        with tempfile.TemporaryDirectory() as d:
+            src, out = os.path.join(d, "in.rules"), os.path.join(d, "out.rules")
+            with open(src, "w") as f:
+                f.write(rule)
+            proc = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "suricata.py"), src, "-o", out, *extra], capture_output=True, text=True)
+            with open(out) as f:
+                return f.read(), proc.stderr
+
+    def test_the_private_ranges_are_used_when_none_is_given(self):
+        text, err = self.run_translator()
+        self.assertIn("src_ip:!192.168.0.0/16", text)
+        self.assertIn("dst_ip:192.168.0.0/16", text)
+        self.assertIn("no --home-net", err)
+
+    def test_an_explicit_home_net_wins(self):
+        text, err = self.run_translator("--home-net", "10.9.0.0/16")
+        self.assertIn("src_ip:!10.9.0.0/16", text)
+        self.assertNotIn("192.168", text)
+        self.assertNotIn("no --home-net", err)
+
+
 class Transforms(unittest.TestCase):
     def test_url_decode_becomes_a_transform_on_the_raw_uri(self):
         out, why = convert('http.uri.raw; url_decode; content:"../";')

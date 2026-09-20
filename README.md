@@ -149,7 +149,13 @@ cargo build --release
 **2. Get the rules and translate them.** Download the Emerging Threats
 Open ruleset (`emerging-all.rules`, from rules.emergingthreats.net) and
 translate it. `--home-net` should list *your* internal ranges, because ET
-rules are written in terms of `$HOME_NET` and `$EXTERNAL_NET`.
+rules are written in terms of `$HOME_NET` and `$EXTERNAL_NET`. **Always pass it,
+and always run `--validate`.** Without a home network `$EXTERNAL_NET` means
+"any", and a rule written for traffic from outside fires on your own machines
+(a live run alerted on a router's UPnP announcements for exactly that reason),
+so the translator now defaults to the private ranges, as Suricata does, and
+says so. And a rules file containing one rule ARGUS refuses is rejected whole
+on reload (the previous rules stay in force), which `--validate` prevents.
 `--validate` has ARGUS itself confirm every generated rule loads.
 
 ```bash
@@ -276,7 +282,7 @@ aggregator thread that owns all cross-source state.
 | `BRUTE_FORCE` | Many authentication attempts to one service, **or** many the server *refused*: FTP 530, SMTP 535, HTTP 401, SMB logon failure, Kerberos `KRB-ERROR`, LDAP `invalidCredentials`. A refusal is the server's own testimony and is held to a far lower bar than an attempt |
 | `BEACONING` | Repeated connections to one service at a regular interval with low jitter |
 | `DATA_EXFIL_VOLUME` | One source sent more than the configured volume outbound inside the window |
-| `DATA_EXFIL_RATIO` | One source sent far more than it received, above a volume floor |
+| `DATA_EXFIL_RATIO` | One source sent far more than it received, above a volume floor. Judged while connections are open (each reports every 30 seconds), not only when they end |
 | `DNS_TUNNEL` | Many distinct high-entropy subdomains queried under one parent domain |
 | `DNS_LONG_NAME` | A single question name both unusually long and high-entropy |
 
@@ -286,7 +292,17 @@ web browser; "many destinations on one port that never answered"
 describes only the sweep. Multicast and broadcast destinations are
 excluded from behavioural analysis entirely: service-discovery protocols
 re-announce on a fixed timer by specification, which is perfectly
-periodic by design and not evidence of anything.
+periodic by design and not evidence of anything. So are directed
+broadcasts of the private ranges (`192.168.0.255`): a sensor cannot know the
+netmask, and on those ranges a host ending in 255 is overwhelmingly a
+broadcast.
+
+**Tuning on a real network.** Behavioural alerts describe a *shape*, and
+the commonest benign shapes are yours: a chat or API client uploading a large
+conversation (a big request, a small reply) reads as `DATA_EXFIL_RATIO`, and a
+browser's keepalives read as `BEACONING`. Make the verdict stick with the
+[allowlist](#allowlist), for example
+`category:DATA_EXFIL_RATIO dst:160.79.104.10 dst_port:443`.
 
 ### 4. Reputation enrichment
 
@@ -1255,8 +1271,8 @@ exceptions being genuinely malformed or non-IP frames.
 ## Testing and measurement
 
 ```bash
-cargo test --release                        # 476 unit and integration tests
-python tools/test_suricata.py               # 111 translator tests
+cargo test --release                        # 480 unit and integration tests
+python tools/test_suricata.py               # 113 translator tests
 python tools/detect.py --survive corpus     # survival and noise on real captures
 python tools/detect.py                      # graded detection
 python tools/detect.py --evasion            # attacks shaped to evade

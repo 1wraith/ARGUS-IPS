@@ -77,6 +77,17 @@ pub enum Observation {
     /// counts here and the sum is judged in one place.
     Volume { ts_sec: i64, src: IpAddr, packets: u32 },
 
+    /// Bytes moved by a connection that is still open.
+    ///
+    /// A [`Observation::Flow`] is sent when a connection ends, so a
+    /// long one (a download, a tunnel, a streaming upload) was invisible
+    /// to the volume detectors for its whole life: a live run reported
+    /// an exfiltration alert forty minutes after it began. This carries
+    /// what has moved since the last report, feeds the volume
+    /// detectors only, and does not count as a connection (which the scan
+    /// and beacon detectors count from `Flow`).
+    Traffic { ts_sec: i64, src: IpAddr, dst: IpAddr, dst_port: u16, bytes_out: u64, bytes_in: u64 },
+
     /// The server *refused* a credential: an FTP 530, an SMTP 535, an HTTP
     /// 401, an SMB logon failure. `src` is the client that tried.
     ///
@@ -139,6 +150,7 @@ impl Observation {
         match self {
             Observation::AuthAttempt { ts_sec, src, dst, dst_port, service } => (*ts_sec, 0, ip(src), ip(dst), *dst_port, 0, 0, service.as_bytes()),
             Observation::Volume { ts_sec, src, packets } => (*ts_sec, 4, ip(src), ip(&IpAddr::UNSPECIFIED), 0, *packets as u64, 0, &[]),
+            Observation::Traffic { ts_sec, src, dst, dst_port, bytes_out, bytes_in } => (*ts_sec, 5, ip(src), ip(dst), *dst_port, *bytes_out, *bytes_in, &[]),
             Observation::AuthFailure { ts_sec, src, dst, dst_port, service } => (*ts_sec, 1, ip(src), ip(dst), *dst_port, 0, 0, service.as_bytes()),
             Observation::Flow { ts_sec, src, dst, dst_port, bytes_out, bytes_in, answered } => {
                 (*ts_sec, 2, ip(src), ip(dst), *dst_port, *bytes_out, (bytes_in << 1) | *answered as u64, &[])
@@ -153,8 +165,28 @@ impl Observation {
             | Observation::AuthFailure { ts_sec, .. }
             | Observation::Flow { ts_sec, .. }
             | Observation::Volume { ts_sec, .. }
+            | Observation::Traffic { ts_sec, .. }
             | Observation::DnsQuery { ts_sec, .. } => *ts_sec,
         }
+    }
+}
+
+/// Group addresses and broadcasts, including the directed broadcast of a
+/// private network (`192.168.0.255`).
+///
+/// A directed broadcast cannot be recognised without knowing the netmask,
+/// which a sensor does not. On the private ranges a host address ending in
+/// 255 is overwhelmingly a broadcast (a /24 is the common case), and
+/// treating one as a beacon target is the far more expensive mistake: a live
+/// run flagged an application announcing itself to `192.168.0.255` every six
+/// seconds, which is exactly what such an announcement is.
+fn is_broadcast_like(dst: &IpAddr) -> bool {
+    if dst.is_multicast_or_broadcast() {
+        return true;
+    }
+    match dst {
+        IpAddr::V4(o) => o[3] == 255 && (o[0] == 10 || (o[0] == 172 && (16..32).contains(&o[1])) || (o[0] == 192 && o[1] == 168)),
+        _ => false,
     }
 }
 
@@ -381,6 +413,11 @@ impl BehaviorEngine {
                 self.on_flow(now_sec, *src, *dst, *dst_port, *bytes_out, *bytes_in, out)
             }
             Observation::Volume { src, packets, .. } => self.on_volume(now_sec, *src, *packets, out),
+            Observation::Traffic { src, dst, dst_port, bytes_out, bytes_in, .. } => {
+                if !is_broadcast_like(dst) {
+                    self.on_bytes(now_sec, *src, *dst, *dst_port, *bytes_out, *bytes_in, out)
+                }
+            }
             Observation::DnsQuery { src, dst, name, name_len, .. } => self.on_dns(now_sec, *src, *dst, &name[..*name_len as usize], out),
         }
 
@@ -577,7 +614,7 @@ impl BehaviorEngine {
         // out/in ratio up for reasons that have nothing to do with
         // exfiltration. You cannot exfiltrate to a multicast group off
         // the local segment anyway.
-        if dst.is_multicast_or_broadcast() {
+        if is_broadcast_like(&dst) {
             return;
         }
         if let Some(p) = self.pair((src, dst, dst_port), now_sec) {
@@ -605,7 +642,14 @@ impl BehaviorEngine {
             }
         }
 
-        // Volume is judged per source across all its flows.
+        self.on_bytes(now_sec, src, dst, dst_port, bytes_out, bytes_in, out);
+    }
+
+    /// Volume is judged per source across all its flows, and across a
+    /// flow's life: both a finished connection and an open one report here.
+    #[allow(clippy::too_many_arguments)]
+    fn on_bytes(&mut self, now_sec: i64, src: IpAddr, dst: IpAddr, dst_port: u16, bytes_out: u64, bytes_in: u64, out: &mut Vec<Alert>) {
+        let cfg = self.cfg;
         let Some(s) = self.source(src, now_sec) else { return };
         let total_out = s.bytes_out.add(now_sec, bytes_out);
         let total_in = s.bytes_in.add(now_sec, bytes_in);
@@ -1378,6 +1422,38 @@ mod tests {
             engine.observe(&Observation::Volume { ts_sec: 5_000 + s, src, packets: 500 }, &mut out);
         }
         assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn a_directed_broadcast_on_a_private_network_is_not_a_beacon_target() {
+        assert!(is_broadcast_like(&v4(192, 168, 0, 255)));
+        assert!(is_broadcast_like(&v4(10, 4, 9, 255)));
+        assert!(is_broadcast_like(&v4(172, 20, 1, 255)));
+        assert!(!is_broadcast_like(&v4(192, 168, 0, 254)));
+        assert!(!is_broadcast_like(&v4(8, 8, 8, 255)), "a public address ending in 255 is an ordinary host");
+        assert!(!is_broadcast_like(&v4(172, 32, 1, 255)), "outside 172.16/12");
+    }
+
+    #[test]
+    fn a_connection_that_is_still_open_counts_towards_volume_as_it_goes() {
+        let src = v4(192, 168, 0, 112);
+        let mut engine = BehaviorEngine::new(BehaviorConfig { exfil_ratio_min_bytes: 1_000_000, ..BehaviorConfig::default() });
+        let mut out = Vec::new();
+        // 6 MB up and nothing back, reported while the connection is open.
+        engine.observe(&Observation::Traffic { ts_sec: 5_000, src, dst: v4(203, 0, 113, 9), dst_port: 443, bytes_out: 6_000_000, bytes_in: 10_000 }, &mut out);
+        assert!(out.iter().any(|a| a.category == "DATA_EXFIL_RATIO"), "seen while it is happening, not at the end");
+    }
+
+    #[test]
+    fn an_open_connection_is_not_counted_as_a_connection() {
+        // Beaconing counts connection starts; a byte report is not one.
+        let src = v4(10, 0, 0, 1);
+        let mut engine = BehaviorEngine::new(BehaviorConfig::default());
+        let mut out = Vec::new();
+        for i in 0..30 {
+            engine.observe(&Observation::Traffic { ts_sec: 5_000 + i * 60, src, dst: v4(203, 0, 113, 9), dst_port: 443, bytes_out: 10, bytes_in: 10 }, &mut out);
+        }
+        assert!(out.iter().all(|a| a.category != "BEACONING"), "{:?}", out.iter().map(|a| a.category).collect::<Vec<_>>());
     }
 
 }

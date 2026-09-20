@@ -2844,6 +2844,9 @@ impl AnomalyEngine {
 /// who wants to make a different call on this tradeoff.
 pub const DEFAULT_STREAM_CAP: usize = 16384;
 const MAX_OOO_SEGMENTS: usize = 16;
+
+/// How often an open connection reports the bytes it has moved.
+const INTERIM_REPORT_SECS: i64 = 30;
 const FLOW_IDLE_TIMEOUT_SECS: i64 = 300;
 
 /// Per-worker cap on concurrently tracked TCP connections.
@@ -3377,6 +3380,11 @@ struct Flow {
     pkts_to_server: u64,
     pkts_to_client: u64,
     bytes_to_server: u64,
+    /// How much of each direction has already been reported to the
+    /// aggregator while the connection was open, and when.
+    reported_out: u64,
+    reported_in: u64,
+    last_report_sec: i64,
     bytes_to_client: u64,
     flags_to_server: u8,
     flags_to_client: u8,
@@ -3423,8 +3431,9 @@ impl Flow {
             src: self.client.0,
             dst: self.server.0,
             dst_port: self.server.1,
-            bytes_out: self.bytes_to_server,
-            bytes_in: self.bytes_to_client,
+            // Only what has not been reported already.
+            bytes_out: self.bytes_to_server.saturating_sub(self.reported_out),
+            bytes_in: self.bytes_to_client.saturating_sub(self.reported_in),
             answered: self.answered(),
         }
     }
@@ -3832,6 +3841,9 @@ impl FlowTable {
             pkts_to_server: 0,
             pkts_to_client: 0,
             bytes_to_server: 0,
+            reported_out: 0,
+            reported_in: 0,
+            last_report_sec: now_sec,
             bytes_to_client: 0,
             flags_to_server: 0,
             flags_to_client: 0,
@@ -3865,6 +3877,17 @@ impl FlowTable {
 
         if direction == Direction::ToServer && p.tcp_flags & TCP_SYN != 0 && p.tcp_flags & TCP_ACK == 0 {
             flow.saw_syn = true;
+        }
+        // Report the bytes moved so far now and then, so that a connection
+        // that lasts an hour is not invisible to volume detection for the hour.
+        if now_sec - flow.last_report_sec >= INTERIM_REPORT_SECS {
+            let (out_delta, in_delta) = (flow.bytes_to_server - flow.reported_out, flow.bytes_to_client - flow.reported_in);
+            flow.last_report_sec = now_sec;
+            if out_delta + in_delta > 0 {
+                flow.reported_out = flow.bytes_to_server;
+                flow.reported_in = flow.bytes_to_client;
+                self.observations.push(crate::behavior::Observation::Traffic { ts_sec: now_sec, src: flow.client.0, dst: flow.server.0, dst_port: flow.server.1, bytes_out: out_delta, bytes_in: in_delta });
+            }
         }
         if p.tcp_flags & TCP_RST != 0 {
             flow.reset = true;
@@ -8527,4 +8550,46 @@ Accept:*/*";
         large_cap_table.observe(&seg2, now, 9_100_000, &sig, &mut alerts2);
         assert!(alerts2.iter().any(|a| a.category == "SIGNATURE_MATCH"), "a large enough stream cap should still catch the same signature");
     }
+
+    /// A connection that outlasts the window must be judged while it runs.
+    #[test]
+    fn a_long_connection_reports_its_bytes_while_it_is_open_and_never_twice() {
+        let sig = SignatureEngine { blacklist: Default::default(), rules: RuleSet::empty() };
+        let mut table = FlowTable::new();
+        table.enable_flow_records();
+        let mut alerts = Vec::new();
+        let (client, server) = ([10, 0, 0, 5], [10, 0, 0, 1]);
+        let base = 2_000_000i64;
+        let at = |sec: i64| UNIX_EPOCH + Duration::from_secs(sec as u64);
+        let syn = parse(&build_tcp_frame(client, server, 51234, 443, 1000, TCP_SYN, &[]));
+        table.observe(&syn, at(base), base, &sig, &mut alerts);
+        // Two minutes of steady upload: one 1400-byte segment a second.
+        let mut seq = 1001u32;
+        for i in 1..=120 {
+            let f = parse(&build_tcp_frame(client, server, 51234, 443, seq, TCP_PSH | TCP_ACK, &[b'x'; 1400]));
+            seq += 1400;
+            table.observe(&f, at(base + i), base + i, &sig, &mut alerts);
+        }
+        let mut obs = Vec::new();
+        table.take_observations(&mut obs);
+        let mid: u64 = obs.iter().filter_map(|o| if let crate::behavior::Observation::Traffic { bytes_out, .. } = o { Some(*bytes_out) } else { None }).sum();
+        assert!(mid > 100_000, "reported while still open: {} bytes", mid);
+        assert!(!obs.iter().any(|o| matches!(o, crate::behavior::Observation::Flow { .. })), "the connection has not ended");
+
+        // When it ends, the final report carries only the remainder: the
+        // whole is counted exactly once.
+        let mut records = Vec::new();
+        table.flush_open_flows(&mut records, &mut alerts);
+        table.take_observations(&mut obs);
+        let total: u64 = obs
+            .iter()
+            .map(|o| match o {
+                crate::behavior::Observation::Traffic { bytes_out, .. } | crate::behavior::Observation::Flow { bytes_out, .. } => *bytes_out,
+                _ => 0,
+            })
+            .sum();
+        let sent = records.iter().map(|r| r.bytes_to_server).sum::<u64>();
+        assert_eq!(total, sent, "every byte reported once");
+    }
+
 }

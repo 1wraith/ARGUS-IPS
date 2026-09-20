@@ -322,6 +322,9 @@ def variable_op_spec(name, value):
     return ",".join(parts)
 
 
+DEFAULT_HOME_NET = "192.168.0.0/16,10.0.0.0/8,172.16.0.0/12"
+
+
 XBIT_VERBS = ("set", "unset", "toggle", "isset", "isnotset")
 
 
@@ -1556,7 +1559,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("input")
     ap.add_argument("-o", "--output")
-    ap.add_argument("--home-net", default="", help="e.g. 192.168.0.0/16,10.0.0.0/8")
+    ap.add_argument("--home-net", default="", help="your internal ranges; defaults to the private ranges, as Suricata does")
     ap.add_argument("--stats", action="store_true")
     ap.add_argument(
         "--validate",
@@ -1566,6 +1569,14 @@ def main():
     args = ap.parse_args()
 
     skipped = collections.Counter()
+    # Rules are written against $HOME_NET and $EXTERNAL_NET. With no home
+    # network, both mean "any", so a rule written for traffic *from outside*
+    # fires on the sensor's own machines: a live run alerted on a router's UPnP
+    # announcements for exactly that reason. Suricata's own default is the
+    # private ranges, and so is this.
+    if not args.home_net:
+        args.home_net = DEFAULT_HOME_NET
+        print("note: no --home-net given; using %s (Suricata's default). Name your own ranges with --home-net." % DEFAULT_HOME_NET, file=sys.stderr)
     converted, total = [], 0
     with open(args.input, encoding="utf-8", errors="replace") as f:
         for line in f:
