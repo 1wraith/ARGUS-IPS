@@ -1,0 +1,58 @@
+{
+  // Build/run tasks. Ctrl+Shift+P -> "Tasks: Run Task", or Ctrl+Shift+B
+  // for the default build.
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "cargo build (release)",
+      "type": "shell",
+      "command": "cargo build --release",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$rustc"],
+      "presentation": { "reveal": "silent", "clear": true }
+    },
+    {
+      // Much slower at runtime, but keeps variables and line numbers
+      // intact for stepping through the parsers.
+      "label": "cargo build (debug)",
+      "type": "shell",
+      "command": "cargo build",
+      "group": "build",
+      "problemMatcher": ["$rustc"],
+      "presentation": { "reveal": "silent", "clear": true }
+    },
+    {
+      "label": "cargo test",
+      "type": "shell",
+      "command": "cargo test --release",
+      "group": { "kind": "test", "isDefault": true },
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      // Prints the device names the -iface flag expects. Needs no
+      // privileges to *list*, only to capture.
+      "label": "argus: list interfaces",
+      "type": "shell",
+      "command": "${workspaceFolder}/target/release/argus.exe -list-interfaces",
+      "dependsOn": "cargo build (release)",
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated" }
+    },
+    {
+      "label": "argus: replay corpus",
+      "type": "shell",
+      "command": "python tools/detect.py --survive corpus/ --rules rules.txt",
+      "dependsOn": "cargo build (release)",
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated" }
+    },
+    {
+      // The benchmark suite, for checking a change didn't cost anything.
+      "label": "argus: benchmark",
+      "type": "shell",
+      "command": "cargo run --release --example bench",
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated" }
+    }
+  ]
+}

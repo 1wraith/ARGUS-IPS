@@ -1,0 +1,37 @@
+[package]
+name = "argus"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[dependencies]
+pcap = "1.1"
+anyhow = "1.0"
+rustc-hash = "1.1"
+regex = "1.10"
+# Already a dependency of regex and aho-corasick; named here because the
+# case-insensitive literal search uses it directly.
+memchr = "2"
+# Only for the handful of PCRE constructs the linear engine cannot express
+# (lookaround, backreferences), always behind a hard backtrack limit.
+fancy-regex = "0.13"
+md-5 = "0.10"
+# QUIC Initial packets are encrypted with keys derived from a value the
+# packet itself carries, so a passive observer can read them — but only by
+# doing real AES-GCM and HKDF. These are the RustCrypto implementations:
+# pure Rust, no C, and far better tested than a hand-rolled AES would be.
+aes = "0.8"
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+aho-corasick = "1.1"
+crossbeam-channel = "0.5"
+ctrlc = "3.4"
+libc = "0.2"

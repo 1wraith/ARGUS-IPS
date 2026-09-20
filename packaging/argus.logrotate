@@ -1,0 +1,26 @@
+# /etc/logrotate.d/argus
+#
+# ARGUS can rotate by size on its own (-log-max-size), which is what
+# Windows deployments use. On Linux the convention is logrotate, and the
+# two coexist: leave -log-max-size at 0 and let this file drive it.
+#
+# The important line is `postrotate`. logrotate renames the file out from
+# under the process, which keeps writing to the renamed inode until told
+# otherwise; SIGHUP makes ARGUS reopen the *path*. Without it the "live"
+# log stays empty forever while the rotated one grows, which is a failure
+# that looks exactly like a sensor that has stopped alerting.
+
+/var/log/argus/*.log /var/log/argus/*.eve /var/log/argus/*.ndjson {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 argus argus
+    sharedscripts
+    postrotate
+        /bin/kill -HUP $(cat /run/argus.pid 2>/dev/null) 2>/dev/null || \
+            systemctl reload argus.service >/dev/null 2>&1 || true
+    endscript
+}

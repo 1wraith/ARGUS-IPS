@@ -1,0 +1,19 @@
+# Build output (including the private verification build the tools use)
+/target/
+/target-verify/
+
+# Captures and generated data: large, and reproducible or downloadable
+/corpus/
+/logs/
+*.pcap
+*.pcapng
+*.log
+*.alerts.jsonl
+
+# Rulesets are downloaded and translated, not versioned
+/emerging-all.rules
+/et-open.rules
+
+# Python
+__pycache__/
+*.pyc
