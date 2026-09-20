@@ -1,0 +1,213 @@
+# Rule format: name|buffer|direction|type|pattern
+#
+#   buffer:    payload | http.uri | http.host | dns.query | tls.sni |
+#              tls.ja3 | ftp.command | ssh.version | smtp.command |
+#              smtp.sender | smtp.recipient | smb.command | smb.filename |
+#              modbus.function | modbus.address | rdp.cookie |
+#              tftp.opcode | tftp.filename | snmp.community |
+#              dnp3.function
+#   direction: any | to_server | to_client
+#   type:      literal | regex | not_literal | not_regex
+#   pattern:   literal string, or a regex (regex syntax: the `regex` crate,
+#              basically PCRE-like). The pattern is always the LAST field on
+#              the line, so it's safe for a regex to contain '|' itself.
+#
+# Literal rules are the fast path (compiled into a shared multi-pattern
+# automaton per buffer+direction). Regex rules are more expressive but
+# checked individually, so prefer literal where a plain substring will do.
+#
+# "not_literal"/"not_regex" alert when the pattern is ABSENT. These only
+# apply to the structured buffers, never to raw payload, since "absent so
+# far" isn't meaningful for a buffer that's still growing.
+
+# --- payload: matched against the full reassembled TCP stream (both
+#     packets of a signature split across two segments will still match),
+#     or the single-packet payload for UDP/ICMP ---
+sql-injection-union|payload|any|literal|UNION SELECT
+sql-injection-or1eq1|payload|any|literal|' OR '1'='1
+path-traversal-etc-passwd|payload|any|literal|../../../../etc/passwd
+# NOTE: `<script>` in a raw payload is ordinary web traffic — it matched
+# 20 times in the benign corpus, all of them legitimate pages. The v2
+# form below scopes it to a URI, where it is a reflected-XSS attempt
+# rather than a page containing a script tag.
+cmd-exec-attempt|payload|any|literal|; cat /etc/shadow
+windows-cmd-exec|payload|any|literal|cmd.exe /c
+log4shell-jndi|payload|any|literal|${jndi:ldap://
+webshell-marker|payload|any|literal|eval(base64_decode(
+
+# --- http.uri / http.host: matched against parsed HTTP request fields,
+#     not raw bytes, so these can't be evaded by moving the same string
+#     to a different part of the request ---
+path-traversal-uri|http.uri|to_server|regex|\.\./\.\./
+admin-panel-probe|http.uri|to_server|literal|/wp-admin
+sql-injection-uri|http.uri|to_server|regex|(?i)(union\s+select|or\s+1=1)
+
+# --- dns.query: matched against the decoded DNS question name ---
+suspicious-tld|dns.query|any|regex|\.(zip|top|xyz)$
+
+# --- tls.sni: matched against the ClientHello's Server Name Indication —
+#     this works WITHOUT decrypting anything, since SNI is sent in
+#     plaintext during the handshake ---
+known-bad-domain|tls.sni|to_server|literal|malicious-c2-domain.example
+
+# --- tls.ja3: matched against the computed JA3 client fingerprint (an
+#     MD5 hash derived from the ClientHello's version/ciphers/extensions/
+#     curves — the standard way to fingerprint a TLS *client*
+#     implementation without decryption). Real values come from threat-
+#     intel JA3 lists; this is a placeholder to show the syntax ---
+# known-malware-ja3|tls.ja3|to_server|literal|e7d705a3286e19ea42f587b344ee6865
+
+# --- negation example: alert if a request to your API doesn't carry your
+#     expected internal auth header value (only meaningful once the
+#     Host header is fully parsed, hence why negation is restricted to
+#     structured buffers, not the raw in-progress payload) ---
+# missing-expected-host|http.host|to_server|not_literal|internal-api.corp
+
+# --- ftp.command: matched against each FTP control-channel command line
+#     as it arrives (a session sends many of these, unlike the one-shot
+#     buffers above — every new command gets checked, not just the first)
+ftp-sensitive-file|ftp.command|to_server|regex|^RETR\s+.*(shadow|passwd|\.pem|\.key)
+ftp-anonymous-login|ftp.command|to_server|literal|USER anonymous
+
+# --- ssh.version: matched against the plaintext SSH version banner both
+#     sides exchange before the encrypted transport begins — this is the
+#     ONLY plaintext part of an SSH connection, so this is checked once,
+#     not per-packet ---
+# NOTE: SSH-1 in use is a genuine weakness and not an intrusion, so it
+# is a v2 rule at MEDIUM rather than a v1 rule at HIGH. It was the last
+# 11 of the benign corpus's HIGH alerts; a hygiene finding repeated per
+# host should not outrank an exploit attempt in a triage queue.
+
+# --- smtp.command / smtp.sender / smtp.recipient: matched against each
+#     SMTP control-channel command as it arrives, with sender/recipient
+#     addresses parsed out of MAIL FROM / RCPT TO separately so they can
+#     be matched without the surrounding command syntax ---
+smtp-relay-probe|smtp.command|to_server|literal|VRFY root
+# known-spam-sender|smtp.sender|to_server|literal|spammer@evil.example
+
+# --- smb.command / smb.filename: matched against every parsed SMB2/3
+#     message as it arrives (like FTP/SMTP, a session carries many).
+#     smb.filename is only populated for CREATE (file/share open)
+#     requests specifically — the highest-value SMB2 message for this
+#     kind of detection. SMB1 and encrypted SMB3 are NOT parsed; see the
+#     README for why ---
+smb-admin-share-access|smb.filename|to_server|regex|(?i)admin\$
+smb-hidden-share-access|smb.filename|to_server|regex|(?i)^[a-z]\$\\
+smb-write-to-startup|smb.filename|to_server|regex|(?i)start\s*menu.*startup
+
+# --- modbus.function / modbus.address: matched against every parsed
+#     Modbus/TCP message. Modbus is gated to port 502 rather than
+#     content-sniffed (see the README) — a rule against these buffers
+#     simply never fires on non-Modbus-port traffic, regardless of what
+#     the bytes happen to look like. modbus.address is only populated
+#     for the write-type function codes (0x05/0x06/0x0F/0x10/0x16),
+#     since that's the field with real ICS security relevance ---
+modbus-any-write|modbus.function|to_server|regex|^WRITE_
+modbus-write-to-safety-register|modbus.address|to_server|literal|0
+
+# --- rdp.cookie: matched against the optional "Cookie: mstshash=<value>"
+#     routing token some RDP clients (and many brute-force tools) send in
+#     the very first, always-cleartext connection request — visible even
+#     for NLA/CredSSP-secured sessions, since the negotiation to use them
+#     happens after this exchange, not before. cookie is always present
+#     (empty string, not absent, when no cookie was sent) specifically so
+#     a not_literal rule below is meaningful ---
+rdp-admin-brute-force|rdp.cookie|to_server|regex|(?i)mstshash=(administrator|admin|root)
+
+# --- tftp.opcode / tftp.filename: matched per-packet (UDP has no stream
+#     to reassemble) against every TFTP request. Gated to port 69 rather
+#     than content-sniffed — TFTP's 2-byte opcode field is as weak a
+#     signal as Modbus's protocol-ID field. filename is only populated
+#     for RRQ/WRQ (read/write requests) ---
+tftp-firmware-pull|tftp.filename|any|regex|(?i)\.(bin|img|cfg)$
+tftp-write-request|tftp.opcode|any|literal|WRQ
+
+# --- snmp.community: matched against the plaintext community string in
+#     an SNMPv1/v2c message (SNMPv3 has no plaintext community string
+#     and isn't parsed). Gated to port 161/162 rather than content-
+#     sniffed, for the same reason as Modbus/TFTP ---
+# NOTE: the v1 forms of these were removed, not disabled. A v1 rule has
+# no severity and no header scoping, so `community == "public"` fired at
+# HIGH on every SNMP poll on the network: 201 of the 282 alerts a benign
+# 300-second enterprise capture produced, which is 2,400 an hour from one
+# line. Default communities are worth knowing about and are not an
+# attack, so the v2 forms below say so — LOW, and only when the traffic
+# crosses the network boundary, where it is a real exposure rather than
+# ordinary monitoring.
+
+# --- dnp3.function: matched against every parsed DNP3 application-layer
+#     message. Gated to port 20000 like Modbus/TFTP/SNMP, even though
+#     DNP3's 2-byte sync pattern is a stronger signal than any of those
+#     three — see the README for why it's still grouped with the
+#     port-gated protocols rather than content-sniffed like SMB2 ---
+dnp3-device-control|dnp3.function|to_server|regex|^(OPERATE|DIRECT_OPERATE)
+dnp3-restart-command|dnp3.function|to_server|regex|RESTART
+# =====================================================================
+# v2 rules: header-scoped, multi-content, anchored, identified
+# =====================================================================
+#
+# Everything above is v1 (`name|buffer|direction|type|pattern`), which
+# still loads unchanged. Below are the same kinds of signature written
+# in the v2 grammar, which adds the things a real signature needs: a
+# header condition, several ANDed contents, positional anchoring, and a
+# sid and severity of its own. See "The rule file format" in the README.
+
+# SQL injection, scoped to web ports and anchored near the start of the
+# URI. Both terms must be present, which is what stops it firing on any
+# URI that merely mentions one of the words.
+rule sid:1000001; name:"sqli-union-select-uri"; severity:high; proto:tcp; dst_port:80,443,8000-8100,8080; direction:to_server; buffer:http.uri; content:"UNION"; nocase; offset:0; depth:300; content:"SELECT"; nocase;
+
+# Path traversal, but not the many benign URIs that contain "..".
+rule sid:1000002; name:"path-traversal-etc"; severity:high; proto:tcp; dst_port:80,8080,8000; direction:to_server; buffer:http.uri; content:"../"; content:"etc/"; nocase;
+
+# Log4Shell: the JNDI marker anywhere in a request URI.
+rule sid:1000003; name:"log4shell-jndi-uri"; severity:high; proto:tcp; direction:to_server; buffer:http.uri; content:"${jndi:"; nocase;
+
+# An SMB2 header on the SMB port, anchored to where the framing puts it.
+# Binary, so written as a hex block.
+rule sid:1000010; name:"smb2-header-present"; severity:low; proto:tcp; dst_port:445; content:"|FE 53 4D 42|"; offset:4; depth:4;
+
+# Writes to an industrial controller, from outside the plant network.
+# The negated source range is the point: a write from the engineering
+# subnet is routine, the same write from anywhere else is not.
+rule sid:1000020; name:"modbus-write-from-outside-plant"; severity:high; proto:tcp; dst_port:502; src_ip:!10.20.0.0/16; direction:to_server; buffer:modbus.function; content:"WRITE_";
+
+# RDP login attempts as a privileged account.
+rule sid:1000030; name:"rdp-privileged-cookie"; severity:high; proto:tcp; dst_port:3389; direction:to_server; buffer:rdp.cookie; pcre:"(?i)mstshash=(administrator|admin|root|guest)";
+
+# A DNS name whose leftmost label looks encoded rather than named. Weak
+# on its own, which is why it's LOW — the DNS_TUNNEL behavioural
+# detector is what counts *how many* of these one host asks for.
+rule sid:1000040; name:"dns-encoded-label-shape"; severity:low; proto:udp; dst_port:53; buffer:dns.query; pcre:"^[0-9a-f]{24,}\.";
+
+# Cleartext credentials on FTP from outside the local network.
+rule sid:1000050; name:"ftp-login-from-outside"; severity:medium; proto:tcp; dst_port:21; src_ip:!10.0.0.0/8,172.16.0.0/12,192.168.0.0/16; direction:to_server; buffer:ftp.command; content:"USER";
+
+# Default SNMP community strings, but only from off-network sources —
+# on-network monitoring using them is a configuration problem, not an
+# intrusion, and shouldn't page anyone at 3am.
+rule sid:1000060; name:"snmp-default-community-external"; severity:high; proto:udp; dst_port:161,162; src_ip:!10.0.0.0/8,172.16.0.0/12,192.168.0.0/16; buffer:snmp.community; content:"public";
+
+# =======================================================================
+# Replacements for three v1 rules the false-positive measurement retired.
+#
+# `python tools/detect.py --fp-rate corpus` reports alerts per hour over
+# captures containing no attacks. Every alert it counts is a false
+# positive by construction, which makes it the one number that says
+# whether this file is worth reading at 3am. These three lines were 82%
+# of it.
+# =======================================================================
+
+# A default community is an exposure, not an intrusion — unless it is
+# being used from outside, which is neither ordinary nor accidental.
+rule sid:1000061; name:"snmp-default-community-internal"; severity:low; proto:udp; dst_port:161,162; buffer:snmp.community; content:"public";
+rule sid:1000062; name:"snmp-private-community-internal"; severity:medium; proto:udp; dst_port:161,162; buffer:snmp.community; content:"private";
+
+# Reflected XSS puts the tag in the request, which is what distinguishes
+# an attempt from a page that merely contains a script.
+rule sid:1000063; name:"xss-script-tag-in-uri"; severity:high; proto:tcp; direction:to_server; buffer:http.uri; content:"<script"; nocase;
+
+# SSH-1 is broken and should not be in use, which is worth reporting —
+# once per host, at a severity that says "fix this" rather than
+# "respond to this".
+rule sid:1000064; name:"ssh-legacy-protocol"; severity:medium; proto:tcp; buffer:ssh.version; pcre:"^SSH-1\.";

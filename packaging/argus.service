@@ -1,0 +1,61 @@
+[Unit]
+Description=ARGUS network intrusion detection system
+Documentation=https://github.com/argus
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/argus -config /etc/argus/argus.conf -no-stdout
+# SIGHUP re-reads the rule and enrichment files and reopens the logs, so
+# `systemctl reload argus` costs no dropped packets. This is the whole
+# reason the reload path exists: a rule change should never be a gap in
+# coverage.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+
+# Capturing needs raw sockets, and nothing else does. Granting the two
+# capabilities is strictly better than running as root: if ARGUS is ever
+# compromised through a packet it parsed, the attacker inherits the
+# ability to read the network, which they already had, rather than the
+# ability to do anything at all on the host.
+User=argus
+Group=argus
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+NoNewPrivileges=yes
+
+# A sensor reads a network and writes logs. It has no reason to touch
+# anything else, so it cannot.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete
+
+# The only writable paths. Add any directory named by -logfile,
+# -flow-log, -alert-output or -pcap-dir that lives elsewhere.
+ReadWritePaths=/var/log/argus
+StateDirectory=argus
+LogsDirectory=argus
+ConfigurationDirectory=argus
+
+# A packet flood is exactly when a sensor should stay predictable. Every
+# table inside ARGUS is already bounded; this is the backstop for the
+# process as a whole.
+MemoryMax=2G
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target

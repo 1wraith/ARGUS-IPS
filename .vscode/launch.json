@@ -1,0 +1,99 @@
+{
+  // Debug/run configurations for ARGUS.
+  //
+  // Requires the CodeLLDB extension (vadimcn.vscode-lldb), which is what
+  // the previous stub in this file assumed. If you'd rather use the
+  // Microsoft C/C++ extension instead, change every "type": "lldb" to
+  // "type": "cppvsdbg" — the rest of each entry is the same.
+  //
+  // IMPORTANT, for the live-capture entries only: Npcap needs
+  // Administrator rights to open an interface. A debugger launched from
+  // VS Code inherits VS Code's own privileges, so live capture only
+  // works if VS Code itself was started as Administrator. Everything
+  // based on -r (replaying a saved capture) needs no privileges at all,
+  // which is why it's the better way to work day to day.
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // The one to start with. No privileges, fast, repeatable.
+      "type": "lldb",
+      "request": "launch",
+      "name": "Replay: corpus/smallFlows.pcap",
+      "program": "${workspaceFolder}/target/release/argus.exe",
+      "args": [
+        "-r", "${workspaceFolder}/corpus/smallFlows.pcap",
+        "-rules", "${workspaceFolder}/rules.txt",
+        "-json",
+        "-logfile", "${workspaceFolder}/argus-alerts.log"
+      ],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "cargo build (release)"
+    },
+    {
+      // Prompts for a path, so you can point it at anything.
+      "type": "lldb",
+      "request": "launch",
+      "name": "Replay: pick a capture",
+      "program": "${workspaceFolder}/target/release/argus.exe",
+      "args": [
+        "-r", "${input:pcapFile}",
+        "-rules", "${workspaceFolder}/rules.txt",
+        "-json",
+        "-logfile", "${workspaceFolder}/argus-alerts.log",
+        "-flow-log", "${workspaceFolder}/argus-flows.log"
+      ],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "cargo build (release)"
+    },
+    {
+      // Stepping through a parser. Uses the DEBUG build, which is far
+      // slower — fine for a small capture, useless for live traffic.
+      "type": "lldb",
+      "request": "launch",
+      "name": "Replay: debug build (for breakpoints)",
+      "program": "${workspaceFolder}/target/debug/argus.exe",
+      "args": [
+        "-r", "${input:pcapFile}",
+        "-rules", "${workspaceFolder}/rules.txt",
+        "-json",
+        "-logfile", "${workspaceFolder}/argus-alerts.log"
+      ],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "cargo build (debug)"
+    },
+    {
+      // Requires VS Code to have been started as Administrator.
+      // Run the "list interfaces" task first to get the device name.
+      "type": "lldb",
+      "request": "launch",
+      "name": "Live capture (needs Administrator)",
+      "program": "${workspaceFolder}/target/release/argus.exe",
+      "args": [
+        "-iface", "${input:interface}",
+        "-rules", "${workspaceFolder}/rules.txt",
+        "-json",
+        "-logfile", "${workspaceFolder}/argus-alerts.log",
+        "-flow-log", "${workspaceFolder}/argus-flows.log",
+        // Keep the sensor's own noise out of its own alert log while
+        // you're working. Drop this to see everything.
+        "-filter", "not port 3389"
+      ],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "cargo build (release)"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "pcapFile",
+      "type": "promptString",
+      "description": "Path to a .pcap/.pcapng file",
+      "default": "${workspaceFolder}/corpus/smallFlows.pcap"
+    },
+    {
+      "id": "interface",
+      "type": "promptString",
+      "description": "Capture interface (run the 'argus: list interfaces' task to see them)",
+      "default": "\\Device\\NPF_{14B5B699-C3A6-4443-B9CC-D27B562EC99A}"
+    }
+  ]
+}

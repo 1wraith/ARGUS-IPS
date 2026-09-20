@@ -1,0 +1,77 @@
+# ARGUS — JA3 blocklist template
+#
+# JA3 hashes the *shape* of a TLS ClientHello (version, cipher list,
+# extension list, curves, point formats) rather than its contents, so it
+# fingerprints the client software regardless of what it is talking to or
+# whether the payload is encrypted. That makes it one of the few useful
+# signals against a TLS-only implant.
+#
+# ---------------------------------------------------------------------
+# WHY THIS FILE SHIPS EMPTY
+# ---------------------------------------------------------------------
+#
+# The mechanism is here and it works; the *data* deliberately isn't.
+#
+# A bundled list of "known-bad" JA3 hashes would be worse than no list.
+# Three reasons:
+#
+#  1. It goes stale immediately. JA3 changes whenever a client's TLS
+#     library is updated, so a hash that identified a family last year
+#     may identify nothing today — or, worse, may now match a legitimate
+#     application that happens to have converged on the same cipher and
+#     extension ordering.
+#  2. Collisions are real. JA3 is a fingerprint of a *configuration*, not
+#     of a program. Anything statically linked against the same TLS
+#     library with the same options produces the same hash, which is why
+#     several widely-published "malware" JA3 values also match ordinary
+#     Go and Python tooling.
+#  3. A hash nobody can source is unauditable. If ARGUS shipped a list,
+#     the natural assumption would be that someone verified it. Nobody
+#     here did, and inventing entries to make the feature look populated
+#     would put fabricated security data in front of whoever reads the
+#     alerts. Better to ship the loader empty and say so.
+#
+# So: populate this from a feed you actually trust and can re-pull
+# (abuse.ch SSLBL's JA3 fingerprint list is the usual starting point),
+# and treat every hit as a lead rather than a verdict.
+#
+# ---------------------------------------------------------------------
+# HOW TO USE IT
+# ---------------------------------------------------------------------
+#
+# These are ordinary v2 rules, so load this alongside your other rules:
+#
+#     argus -iface eth0 -rules rules.txt
+#     argus -iface eth0 -rules ja3-blocklist.txt
+#
+# (One -rules file at a time; concatenate them if you want both.)
+#
+# One line per fingerprint. Keep the sid range distinct so hits are easy
+# to pick out downstream, and put the source and date in the name — a
+# fingerprint with no provenance is impossible to retire later.
+#
+#   rule sid:9000001; name:"ja3 <family> (sslbl 2026-01-15)"; severity:high; buffer:tls.ja3; content:"<32 hex chars>";
+#
+# ---------------------------------------------------------------------
+# STRUCTURAL TLS RULES — no threat intel required
+# ---------------------------------------------------------------------
+#
+# These need no feed and don't go stale, because they describe shapes
+# rather than specific software. They are lower-confidence than a real
+# fingerprint match and are scored accordingly.
+
+# A ClientHello with no SNI at all. Ordinary clients send it (every
+# browser, and anything using virtual hosting depends on it), so its
+# absence on a standard TLS port is unusual: it's what you see from
+# something connecting to a bare IP address, which is common in implant
+# configurations and rare in normal use. `not_literal` on a structured
+# buffer means "this buffer exists and does not contain the pattern", and
+# an empty SNI contains nothing — see the README on negated rules.
+tls-no-sni-on-443|tls.sni|to_server|not_regex|.
+
+# TLS offered on a port that isn't a TLS port. Not inherently malicious —
+# plenty of services run TLS on odd ports on purpose — but it is the
+# shape of an implant choosing a port that looks innocuous, and it pairs
+# usefully with the PROTOCOL_ANOMALY category (which catches the
+# converse: a TLS port carrying something that isn't TLS).
+rule sid:9000900; name:"tls on a non-standard port"; severity:low; proto:tcp; dst_port:!443,8443,993,995,465,587,990,5061; buffer:tls.ja3; pcre:"^[0-9a-f]{32}$";

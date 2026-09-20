@@ -1,0 +1,5 @@
+# One IP address per line. Lines starting with # are ignored.
+# Add IPs you already know are bad: prior attackers, threat-intel feeds,
+# honeypot sources, etc. This is a static list, not auto-updated.
+198.51.100.23
+203.0.113.7
