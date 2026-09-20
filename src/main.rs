@@ -1059,6 +1059,7 @@ fn run_capture<T: pcap::Activated>(
                         continue;
                     }
                     Decoded::Skipped => {
+                        Metrics::inc(&metrics.frames_undecoded);
                         pool.recycle(pkt);
                         continue;
                     }
@@ -1066,6 +1067,7 @@ fn run_capture<T: pcap::Activated>(
                 }
                 {
                     stats.decoded += 1;
+                    Metrics::inc(&metrics.packets_decoded);
                     let tx = &worker_txs[shard_for(&pkt, workers)];
                     if replay {
                         // Blocking send, unlike the live path below. A
