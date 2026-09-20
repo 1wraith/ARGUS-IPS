@@ -35,6 +35,7 @@ pub enum Scan {
 
 const HANDSHAKE: u8 = 0x16;
 const CERTIFICATE: u8 = 11;
+const SERVER_HELLO: u8 = 2;
 
 /// Reads the certificate chain from a server-to-client TLS stream.
 ///
@@ -68,6 +69,84 @@ pub fn scan(stream: &[u8]) -> Scan {
         at += 5 + len;
     }
     finish(&handshake, cut_off)
+}
+
+/// What the server said in its ServerHello.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerHello {
+    /// The version the server chose, as rules write it: `1.2`, `1.3`.
+    pub version: &'static str,
+    /// The JA3S fingerprint: an MD5 of the version, cipher and extension
+    /// types, the server-side counterpart of the client's JA3.
+    pub ja3s: String,
+}
+
+/// Reads the ServerHello from the front of a server-to-client stream.
+///
+/// `None` while it is still arriving, and for anything that is not a
+/// TLS server flight. Unlike the certificate this survives TLS 1.3: the
+/// ServerHello is sent in the clear even when everything after it is not.
+pub fn server_hello(stream: &[u8]) -> Option<ServerHello> {
+    let mut handshake = Vec::new();
+    let mut at = 0;
+    while at + 5 <= stream.len() && stream[at] == HANDSHAKE {
+        let len = u16::from_be_bytes([stream[at + 3], stream[at + 4]]) as usize;
+        let end = (at + 5).checked_add(len)?;
+        if end > stream.len() {
+            break;
+        }
+        handshake.extend_from_slice(&stream[at + 5..end]);
+        at = end;
+        // The ServerHello is the first message; stop as soon as it is whole.
+        if handshake.len() >= 4 {
+            let want = 4 + u32::from_be_bytes([0, handshake[1], handshake[2], handshake[3]]) as usize;
+            if handshake.len() >= want {
+                break;
+            }
+        }
+    }
+    if handshake.len() < 4 || handshake[0] != SERVER_HELLO {
+        return None;
+    }
+    let len = u32::from_be_bytes([0, handshake[1], handshake[2], handshake[3]]) as usize;
+    parse_server_hello(handshake.get(4..4 + len)?)
+}
+
+fn parse_server_hello(body: &[u8]) -> Option<ServerHello> {
+    let legacy = u16::from_be_bytes([*body.first()?, *body.get(1)?]);
+    let mut at = 2 + 32;
+    let session = *body.get(at)? as usize;
+    at += 1 + session;
+    let cipher = u16::from_be_bytes([*body.get(at)?, *body.get(at + 1)?]);
+    at += 2 + 1; // the cipher, then the compression method
+    let mut types: Vec<String> = Vec::new();
+    let mut version = legacy;
+    if let Some(len) = body.get(at..at + 2).map(|b| u16::from_be_bytes([b[0], b[1]]) as usize) {
+        at += 2;
+        let mut exts = body.get(at..at + len)?;
+        while exts.len() >= 4 {
+            let kind = u16::from_be_bytes([exts[0], exts[1]]);
+            let n = u16::from_be_bytes([exts[2], exts[3]]) as usize;
+            let data = exts.get(4..4 + n)?;
+            types.push(kind.to_string());
+            // `supported_versions` carries the real version once 1.3 is
+            // in use; the legacy field then reads 1.2 whatever was chosen.
+            if kind == 43 && data.len() >= 2 {
+                version = u16::from_be_bytes([data[0], data[1]]);
+            }
+            exts = &exts[4 + n..];
+        }
+    }
+    let ja3s_text = format!("{},{},{}", legacy, cipher, types.join("-"));
+    let text = match version {
+        0x0300 => "3.0",
+        0x0301 => "1.0",
+        0x0302 => "1.1",
+        0x0303 => "1.2",
+        0x0304 => "1.3",
+        _ => "unknown",
+    };
+    Some(ServerHello { version: text, ja3s: crate::files::md5_hex(ja3s_text.as_bytes()) })
 }
 
 /// `more` is whether the stream is known to continue past what is here.
@@ -307,6 +386,28 @@ pub(crate) mod fixture {
     }
 
 
+    /// A ServerHello record: legacy version, cipher, and extension types
+    /// (each with an empty body, except `supported_versions` when given).
+    pub(crate) fn server_hello_record(legacy: u16, cipher: u16, extensions: &[(u16, Vec<u8>)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&legacy.to_be_bytes());
+        body.extend_from_slice(&[7u8; 32]);
+        body.push(0); // no session id
+        body.extend_from_slice(&cipher.to_be_bytes());
+        body.push(0); // compression
+        let mut exts = Vec::new();
+        for (kind, data) in extensions {
+            exts.extend_from_slice(&kind.to_be_bytes());
+            exts.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            exts.extend_from_slice(data);
+        }
+        body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        body.extend_from_slice(&exts);
+        let mut msg = vec![SERVER_HELLO, 0, (body.len() >> 8) as u8, body.len() as u8];
+        msg.extend(body);
+        record(&msg)
+    }
+
     /// A server's flight: one record holding a certificate message.
     pub(crate) fn server_flight(subject: &str, issuer: &str, serial: &[u8]) -> Vec<u8> {
         let c = cert(serial, &attr(CN, issuer), &attr(CN, subject));
@@ -392,4 +493,36 @@ mod tests {
         let stream = record(&message(&[vec![0x30, 0x84, 0xff, 0xff, 0xff, 0xff]]));
         assert_eq!(scan(&stream), Scan::None);
     }
+    #[test]
+    fn the_server_hello_gives_a_version_and_a_ja3s() {
+        let flight = server_hello_record(0x0303, 0xc02f, &[(65281, vec![0]), (11, vec![0]), (35, vec![])]);
+        let hello = server_hello(&flight).expect("a whole ServerHello");
+        assert_eq!(hello.version, "1.2");
+        // JA3S is the MD5 of "771,49199,65281-11-35".
+        assert_eq!(hello.ja3s, crate::files::md5_hex(b"771,49199,65281-11-35"));
+    }
+
+    #[test]
+    fn tls_13_is_read_from_supported_versions_not_the_legacy_field() {
+        let flight = server_hello_record(0x0303, 0x1301, &[(43, vec![0x03, 0x04]), (51, vec![0, 1])]);
+        let hello = server_hello(&flight).unwrap();
+        assert_eq!(hello.version, "1.3");
+        assert!(hello.ja3s.len() == 32);
+    }
+
+    #[test]
+    fn a_partial_server_hello_is_not_read() {
+        let flight = server_hello_record(0x0303, 0xc02f, &[(65281, vec![0])]);
+        for n in 0..flight.len() {
+            assert_eq!(server_hello(&flight[..n]), None, "a {}-byte prefix is not a whole ServerHello", n);
+        }
+    }
+
+    #[test]
+    fn something_that_is_not_a_server_hello_is_ignored() {
+        assert_eq!(server_hello(&record(&message(&[sample()]))), None, "a certificate message");
+        assert_eq!(server_hello(b"HTTP/1.1 200 OK\r\n"), None);
+        assert_eq!(server_hello(&[]), None);
+    }
+
 }

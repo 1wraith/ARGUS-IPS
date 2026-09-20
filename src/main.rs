@@ -1059,6 +1059,7 @@ fn run_capture<T: pcap::Activated>(
                         continue;
                     }
                     Decoded::Skipped => {
+                        Metrics::inc(&metrics.frames_undecoded);
                         pool.recycle(pkt);
                         continue;
                     }
@@ -1066,6 +1067,7 @@ fn run_capture<T: pcap::Activated>(
                 }
                 {
                     stats.decoded += 1;
+                    Metrics::inc(&metrics.packets_decoded);
                     let tx = &worker_txs[shard_for(&pkt, workers)];
                     if replay {
                         // Blocking send, unlike the live path below. A
@@ -1590,6 +1592,9 @@ fn main() -> anyhow::Result<()> {
         packet_rate_pps: args.rate_threshold,
         port_scan_limit: args.scan_threshold,
         max_sources: args.max_sources.max(1),
+        // With the aggregator running, the flood is judged there, on the sum
+        // across workers; without it, each worker judges its own share.
+        flood_via_observations: args.behavior,
         ..AnomalyConfig::default()
     };
 
@@ -1704,7 +1709,17 @@ fn main() -> anyhow::Result<()> {
     // cross-source and therefore cannot live in a worker — see
     // `behavior.rs` for why sharding rules that out.
     let (behavior_tx, behavior_join) = if args.behavior {
-        let cfg = BehaviorConfig { window: args.behavior_window, ..BehaviorConfig::default() };
+        // Judged over a fixed short window, not `-window`: a burst averaged
+        // over the five minutes an operator chose to catch slow scans is a
+        // burst nobody sees, and the limit is a rate, so it does not need one.
+        let flood_window: u64 = 10;
+        let cfg = BehaviorConfig {
+            window: args.behavior_window,
+            flood_window_secs: flood_window as i64,
+            flood_limit: (args.rate_threshold as u64).saturating_mul(flood_window),
+            flood_min_interval_secs: flood_window as i64,
+            ..BehaviorConfig::default()
+        };
         let (tx, rx) = crossbeam_channel::bounded::<Observation>(args.alert_queue.max(1));
         let alert_tx = alert_tx.clone();
         let ordered = replay_path.is_some();
@@ -2051,6 +2066,7 @@ fn main() -> anyhow::Result<()> {
             // `-flow-log` meant that with behavioural detection on but the
             // flow log off, nothing was flushed at all.
             alerts.clear();
+            anom_engine.flush_volume(true);
             flow_table.flush_open_flows(&mut flow_records, &mut alerts);
             datagram_flows.flush(&mut flow_records);
             if let Some(tx) = &flow_tx {

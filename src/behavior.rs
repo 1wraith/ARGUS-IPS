@@ -69,6 +69,25 @@ pub enum Observation {
     /// minute even when they keep getting it wrong.
     AuthAttempt { ts_sec: i64, src: IpAddr, dst: IpAddr, dst_port: u16, service: &'static str },
 
+    /// How many packets one worker saw from a source in one second.
+    ///
+    /// Packets are sharded by host *pair*, so a source flooding several
+    /// destinations is split across workers and each sees a fraction of
+    /// it. Only the sum is the flood, so the workers report their
+    /// counts here and the sum is judged in one place.
+    Volume { ts_sec: i64, src: IpAddr, packets: u32 },
+
+    /// Bytes moved by a connection that is still open.
+    ///
+    /// A [`Observation::Flow`] is sent when a connection ends, so a
+    /// long one (a download, a tunnel, a streaming upload) was invisible
+    /// to the volume detectors for its whole life: a live run reported
+    /// an exfiltration alert forty minutes after it began. This carries
+    /// what has moved since the last report, feeds the volume
+    /// detectors only, and does not count as a connection (which the scan
+    /// and beacon detectors count from `Flow`).
+    Traffic { ts_sec: i64, src: IpAddr, dst: IpAddr, dst_port: u16, bytes_out: u64, bytes_in: u64 },
+
     /// The server *refused* a credential: an FTP 530, an SMTP 535, an HTTP
     /// 401, an SMB logon failure. `src` is the client that tried.
     ///
@@ -130,6 +149,8 @@ impl Observation {
         }
         match self {
             Observation::AuthAttempt { ts_sec, src, dst, dst_port, service } => (*ts_sec, 0, ip(src), ip(dst), *dst_port, 0, 0, service.as_bytes()),
+            Observation::Volume { ts_sec, src, packets } => (*ts_sec, 4, ip(src), ip(&IpAddr::UNSPECIFIED), 0, *packets as u64, 0, &[]),
+            Observation::Traffic { ts_sec, src, dst, dst_port, bytes_out, bytes_in } => (*ts_sec, 5, ip(src), ip(dst), *dst_port, *bytes_out, *bytes_in, &[]),
             Observation::AuthFailure { ts_sec, src, dst, dst_port, service } => (*ts_sec, 1, ip(src), ip(dst), *dst_port, 0, 0, service.as_bytes()),
             Observation::Flow { ts_sec, src, dst, dst_port, bytes_out, bytes_in, answered } => {
                 (*ts_sec, 2, ip(src), ip(dst), *dst_port, *bytes_out, (bytes_in << 1) | *answered as u64, &[])
@@ -143,8 +164,29 @@ impl Observation {
             Observation::AuthAttempt { ts_sec, .. }
             | Observation::AuthFailure { ts_sec, .. }
             | Observation::Flow { ts_sec, .. }
+            | Observation::Volume { ts_sec, .. }
+            | Observation::Traffic { ts_sec, .. }
             | Observation::DnsQuery { ts_sec, .. } => *ts_sec,
         }
+    }
+}
+
+/// Group addresses and broadcasts, including the directed broadcast of a
+/// private network (`192.168.0.255`).
+///
+/// A directed broadcast cannot be recognised without knowing the netmask,
+/// which a sensor does not. On the private ranges a host address ending in
+/// 255 is overwhelmingly a broadcast (a /24 is the common case), and
+/// treating one as a beacon target is the far more expensive mistake: a live
+/// run flagged an application announcing itself to `192.168.0.255` every six
+/// seconds, which is exactly what such an announcement is.
+fn is_broadcast_like(dst: &IpAddr) -> bool {
+    if dst.is_multicast_or_broadcast() {
+        return true;
+    }
+    match dst {
+        IpAddr::V4(o) => o[3] == 255 && (o[0] == 10 || (o[0] == 172 && (16..32).contains(&o[1])) || (o[0] == 192 && o[1] == 168)),
+        _ => false,
     }
 }
 
@@ -226,6 +268,11 @@ pub struct BehaviorConfig {
     pub max_sources: usize,
     pub max_pairs: usize,
     pub max_dns_domains: usize,
+    /// The flood limit, judged on the sum across every worker: packets
+    /// from one source inside `flood_window_secs`.
+    pub flood_limit: u64,
+    pub flood_window_secs: i64,
+    pub flood_min_interval_secs: i64,
 }
 
 impl Default for BehaviorConfig {
@@ -249,6 +296,9 @@ impl Default for BehaviorConfig {
             max_sources: 16384,
             max_pairs: 65536,
             max_dns_domains: 16384,
+            flood_limit: 5000,
+            flood_window_secs: 10,
+            flood_min_interval_secs: 10,
         }
     }
 }
@@ -265,6 +315,9 @@ struct SrcState {
     bytes_out: RateWindow,
     bytes_in: RateWindow,
     scan_gate: AlertGate,
+    /// Packets from this source in the flood window, over all workers.
+    packets: RateWindow,
+    flood_gate: AlertGate,
     scan_any_gate: AlertGate,
     exfil_gate: AlertGate,
     ratio_gate: AlertGate,
@@ -359,10 +412,36 @@ impl BehaviorEngine {
                 }
                 self.on_flow(now_sec, *src, *dst, *dst_port, *bytes_out, *bytes_in, out)
             }
+            Observation::Volume { src, packets, .. } => self.on_volume(now_sec, *src, *packets, out),
+            Observation::Traffic { src, dst, dst_port, bytes_out, bytes_in, .. } => {
+                if !is_broadcast_like(dst) {
+                    self.on_bytes(now_sec, *src, *dst, *dst_port, *bytes_out, *bytes_in, out)
+                }
+            }
             Observation::DnsQuery { src, dst, name, name_len, .. } => self.on_dns(now_sec, *src, *dst, &name[..*name_len as usize], out),
         }
 
         self.stats.alerts += (out.len() - before) as u64;
+    }
+
+    /// A worker's per-second packet count for one source.
+    fn on_volume(&mut self, now_sec: i64, src: IpAddr, packets: u32, out: &mut Vec<Alert>) {
+        let (limit, interval, window) = (self.cfg.flood_limit, self.cfg.flood_min_interval_secs, self.cfg.flood_window_secs.max(1));
+        let Some(s) = self.source(src, now_sec) else { return };
+        let total = s.packets.add(now_sec, packets as u64);
+        if total > limit && s.flood_gate.allow(now_sec, interval) {
+            out.push(Alert {
+                timestamp: to_time(now_sec),
+                severity: Severity::High,
+                category: "PACKET_FLOOD",
+                src,
+                dst: IpAddr::UNSPECIFIED,
+                proto: "IP",
+                port: 0,
+                message: format!("{} packets from this source in the last {}s across all destinations (limit {})", total, window, limit),
+                sid: 0,
+            });
+        }
     }
 
     /// Borrows (or creates) per-source state, refusing past the cap.
@@ -373,12 +452,15 @@ impl BehaviorEngine {
             return None;
         }
         let cap = self.cfg.max_pairs;
+        let cfg_flood_window = self.cfg.flood_window_secs.max(1);
         let s = self.sources.entry(src).or_insert_with(|| SrcState {
             unanswered_by_port: FxHashMap::default(),
             unanswered_any: WindowSet::new(cap),
             bytes_out: RateWindow::new(window),
             bytes_in: RateWindow::new(window),
             scan_gate: AlertGate::default(),
+            packets: RateWindow::new(cfg_flood_window),
+            flood_gate: AlertGate::default(),
             scan_any_gate: AlertGate::default(),
             exfil_gate: AlertGate::default(),
             ratio_gate: AlertGate::default(),
@@ -532,7 +614,7 @@ impl BehaviorEngine {
         // out/in ratio up for reasons that have nothing to do with
         // exfiltration. You cannot exfiltrate to a multicast group off
         // the local segment anyway.
-        if dst.is_multicast_or_broadcast() {
+        if is_broadcast_like(&dst) {
             return;
         }
         if let Some(p) = self.pair((src, dst, dst_port), now_sec) {
@@ -560,7 +642,14 @@ impl BehaviorEngine {
             }
         }
 
-        // Volume is judged per source across all its flows.
+        self.on_bytes(now_sec, src, dst, dst_port, bytes_out, bytes_in, out);
+    }
+
+    /// Volume is judged per source across all its flows, and across a
+    /// flow's life: both a finished connection and an open one report here.
+    #[allow(clippy::too_many_arguments)]
+    fn on_bytes(&mut self, now_sec: i64, src: IpAddr, dst: IpAddr, dst_port: u16, bytes_out: u64, bytes_in: u64, out: &mut Vec<Alert>) {
+        let cfg = self.cfg;
         let Some(s) = self.source(src, now_sec) else { return };
         let total_out = s.bytes_out.add(now_sec, bytes_out);
         let total_in = s.bytes_in.add(now_sec, bytes_in);
@@ -1294,6 +1383,77 @@ mod tests {
         let early = unanswered(100, v4(10, 0, 0, 1), v4(10, 0, 0, 2), 80);
         let late = unanswered(200, v4(10, 0, 0, 1), v4(10, 0, 0, 2), 80);
         assert_eq!(late.total_cmp(&early), std::cmp::Ordering::Greater);
+    }
+
+    /// The reason volume is judged here: no single worker sees enough.
+    #[test]
+    fn a_flood_split_across_workers_is_seen_as_one() {
+        let src = v4(198, 51, 100, 7);
+        let cfg = BehaviorConfig { flood_limit: 1000, flood_window_secs: 10, ..BehaviorConfig::default() };
+        let mut engine = BehaviorEngine::new(cfg);
+        let mut out = Vec::new();
+        // Four workers each saw 300 packets in the same second: 1,200 in all,
+        // and no worker's own count reaches the limit.
+        for _ in 0..4 {
+            engine.observe(&Observation::Volume { ts_sec: 5_000, src, packets: 300 }, &mut out);
+        }
+        assert_eq!(out.iter().filter(|a| a.category == "PACKET_FLOOD").count(), 1);
+    }
+
+    #[test]
+    fn volume_below_the_limit_is_not_a_flood_and_a_lull_resets_it() {
+        let src = v4(198, 51, 100, 7);
+        let cfg = BehaviorConfig { flood_limit: 1000, flood_window_secs: 10, ..BehaviorConfig::default() };
+        let mut engine = BehaviorEngine::new(cfg);
+        let mut out = Vec::new();
+        engine.observe(&Observation::Volume { ts_sec: 5_000, src, packets: 600 }, &mut out);
+        // Twenty seconds later the first count has left the window.
+        engine.observe(&Observation::Volume { ts_sec: 5_020, src, packets: 600 }, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn one_alert_per_interval_however_many_counts_arrive() {
+        let src = v4(198, 51, 100, 7);
+        let cfg = BehaviorConfig { flood_limit: 100, flood_window_secs: 10, flood_min_interval_secs: 10, ..BehaviorConfig::default() };
+        let mut engine = BehaviorEngine::new(cfg);
+        let mut out = Vec::new();
+        for s in 0..5 {
+            engine.observe(&Observation::Volume { ts_sec: 5_000 + s, src, packets: 500 }, &mut out);
+        }
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn a_directed_broadcast_on_a_private_network_is_not_a_beacon_target() {
+        assert!(is_broadcast_like(&v4(192, 168, 0, 255)));
+        assert!(is_broadcast_like(&v4(10, 4, 9, 255)));
+        assert!(is_broadcast_like(&v4(172, 20, 1, 255)));
+        assert!(!is_broadcast_like(&v4(192, 168, 0, 254)));
+        assert!(!is_broadcast_like(&v4(8, 8, 8, 255)), "a public address ending in 255 is an ordinary host");
+        assert!(!is_broadcast_like(&v4(172, 32, 1, 255)), "outside 172.16/12");
+    }
+
+    #[test]
+    fn a_connection_that_is_still_open_counts_towards_volume_as_it_goes() {
+        let src = v4(192, 168, 0, 112);
+        let mut engine = BehaviorEngine::new(BehaviorConfig { exfil_ratio_min_bytes: 1_000_000, ..BehaviorConfig::default() });
+        let mut out = Vec::new();
+        // 6 MB up and nothing back, reported while the connection is open.
+        engine.observe(&Observation::Traffic { ts_sec: 5_000, src, dst: v4(203, 0, 113, 9), dst_port: 443, bytes_out: 6_000_000, bytes_in: 10_000 }, &mut out);
+        assert!(out.iter().any(|a| a.category == "DATA_EXFIL_RATIO"), "seen while it is happening, not at the end");
+    }
+
+    #[test]
+    fn an_open_connection_is_not_counted_as_a_connection() {
+        // Beaconing counts connection starts; a byte report is not one.
+        let src = v4(10, 0, 0, 1);
+        let mut engine = BehaviorEngine::new(BehaviorConfig::default());
+        let mut out = Vec::new();
+        for i in 0..30 {
+            engine.observe(&Observation::Traffic { ts_sec: 5_000 + i * 60, src, dst: v4(203, 0, 113, 9), dst_port: 443, bytes_out: 10, bytes_in: 10 }, &mut out);
+        }
+        assert!(out.iter().all(|a| a.category != "BEACONING"), "{:?}", out.iter().map(|a| a.category).collect::<Vec<_>>());
     }
 
 }

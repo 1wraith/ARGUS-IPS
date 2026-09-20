@@ -11,7 +11,7 @@ files, stdout and syslog; exposes Prometheus metrics; reloads its rules
 without dropping a packet; and saves a `.pcap` of the surrounding traffic
 for every alert it raises.
 
-It runs **99.5% of the Emerging Threats Open ruleset** (50,823 of 51,074
+It runs **99.8% of the Emerging Threats Open ruleset** (50,989 of 51,074
 rules translate), is a single binary with no runtime dependencies beyond
 libpcap/Npcap, and needs no database.
 
@@ -149,7 +149,13 @@ cargo build --release
 **2. Get the rules and translate them.** Download the Emerging Threats
 Open ruleset (`emerging-all.rules`, from rules.emergingthreats.net) and
 translate it. `--home-net` should list *your* internal ranges, because ET
-rules are written in terms of `$HOME_NET` and `$EXTERNAL_NET`.
+rules are written in terms of `$HOME_NET` and `$EXTERNAL_NET`. **Always pass it,
+and always run `--validate`.** Without a home network `$EXTERNAL_NET` means
+"any", and a rule written for traffic from outside fires on your own machines
+(a live run alerted on a router's UPnP announcements for exactly that reason),
+so the translator now defaults to the private ranges, as Suricata does, and
+says so. And a rules file containing one rule ARGUS refuses is rejected whole
+on reload (the previous rules stay in force), which `--validate` prevents.
 `--validate` has ARGUS itself confirm every generated rule loads.
 
 ```bash
@@ -158,7 +164,7 @@ python tools/suricata.py emerging-all.rules -o et-open.rules \
     --validate target/release/argus
 ```
 
-(On Windows use `target\release\argus.exe`.) Expect about 50,800 rules
+(On Windows use `target\release\argus.exe`.) Expect about 51,000 rules
 converted and 0 refused. Re-run this whenever you download a newer
 ruleset.
 
@@ -189,7 +195,7 @@ What each choice buys:
 
 | Flag | Why |
 |---|---|
-| `-rules et-open.rules` | The ~50,900 translated ET rules. Behavioural, anomaly and intel detection run regardless |
+| `-rules et-open.rules` | The ~51,000 translated ET rules. Behavioural, anomaly and intel detection run regardless |
 | `-home-net …` | Gives every alert an inbound/outbound/internal direction, and tells ET's `$HOME_NET` rules what "inside" is |
 | `-intel` / `-allowlist` | Reputation feeds, and a way to make a verdict stick. Both are optional; create the files first if you use them |
 | `-format eve` | The format a SIEM that already reads Suricata will ingest |
@@ -248,12 +254,17 @@ Per-worker, per-source sliding windows over packet rate and port spread.
 | Alert | Raised when |
 |---|---|
 | `PORT_SCAN` | One source touched more than `scan-threshold` distinct ports on one destination inside the window. TCP counts SYNs only; UDP is reply-aware, so a source that gets answers is not scanning |
-| `PACKET_FLOOD` | One source exceeded `rate-threshold` packets **per second**, summed across its destinations |
+| `PACKET_FLOOD` | One source exceeded `rate-threshold` packets **per second**, summed across its destinations **and across every worker**, over a fixed ten seconds |
 | `PROTOCOL_ANOMALY` | A connection on a well-known port whose traffic never parsed as that port's protocol: a tunnel, a backdoor on a port chosen to look innocuous, or a misconfiguration |
 
-`rate-threshold` is a rate and is independent of `window`. Widening the
-window to catch a slow scan does not make the flood detector more
-sensitive.
+`rate-threshold` is a rate and is independent of `window`, in both
+directions: widening the window to catch a slow scan neither makes the flood
+detector more sensitive nor averages a burst away. The flood is judged
+over a fixed ten seconds, and on the *sum* across workers: packets are
+sharded by host pair, so a source flooding several destinations is split
+across workers and each sees a fraction of it. Each worker reports its
+per-second count to the aggregator, which judges the total. (With
+`-no-behavior` there is no aggregator, and each worker judges its own share.)
 
 ### 3. Behavioural detection
 
@@ -271,7 +282,7 @@ aggregator thread that owns all cross-source state.
 | `BRUTE_FORCE` | Many authentication attempts to one service, **or** many the server *refused*: FTP 530, SMTP 535, HTTP 401, SMB logon failure, Kerberos `KRB-ERROR`, LDAP `invalidCredentials`. A refusal is the server's own testimony and is held to a far lower bar than an attempt |
 | `BEACONING` | Repeated connections to one service at a regular interval with low jitter |
 | `DATA_EXFIL_VOLUME` | One source sent more than the configured volume outbound inside the window |
-| `DATA_EXFIL_RATIO` | One source sent far more than it received, above a volume floor |
+| `DATA_EXFIL_RATIO` | One source sent far more than it received, above a volume floor. Judged while connections are open (each reports every 30 seconds), not only when they end |
 | `DNS_TUNNEL` | Many distinct high-entropy subdomains queried under one parent domain |
 | `DNS_LONG_NAME` | A single question name both unusually long and high-entropy |
 
@@ -281,7 +292,17 @@ web browser; "many destinations on one port that never answered"
 describes only the sweep. Multicast and broadcast destinations are
 excluded from behavioural analysis entirely: service-discovery protocols
 re-announce on a fixed timer by specification, which is perfectly
-periodic by design and not evidence of anything.
+periodic by design and not evidence of anything. So are directed
+broadcasts of the private ranges (`192.168.0.255`): a sensor cannot know the
+netmask, and on those ranges a host ending in 255 is overwhelmingly a
+broadcast.
+
+**Tuning on a real network.** Behavioural alerts describe a *shape*, and
+the commonest benign shapes are yours: a chat or API client uploading a large
+conversation (a big request, a small reply) reads as `DATA_EXFIL_RATIO`, and a
+browser's keepalives read as `BEACONING`. Make the verdict stick with the
+[allowlist](#allowlist), for example
+`category:DATA_EXFIL_RATIO dst:160.79.104.10 dst_port:443`.
 
 ### 4. Reputation enrichment
 
@@ -331,7 +352,7 @@ parsed as HTTP".
 | HTTP request | method, URI (raw and percent-decoded), host, header block, header names, user agent, cookie, accept / accept-encoding / accept-language, referer, protocol version, body |
 | HTTP response | status code and message, status line, header block, content type and length, `Server`, `Location`, `Set-Cookie`, body |
 | DNS | question name (queries and responses) |
-| TLS | SNI, JA3 client fingerprint, and **the server's certificate** (subject, issuer, serial, raw DER) for TLS before 1.3 |
+| TLS | SNI, JA3 client fingerprint; the server's chosen version and **JA3S** fingerprint (also under TLS 1.3, where the ServerHello is in the clear); and **the server's certificate** (subject, issuer, serial, raw DER) for TLS before 1.3 |
 | **QUIC** | SNI and JA3 from the Initial packet, plus version and connection IDs |
 | **SMB1/2/3** | command, filename, share path |
 | **NTLM** | account, domain, workstation, wherever it is embedded |
@@ -346,7 +367,7 @@ parsed as HTTP".
 | TFTP | opcode, filename |
 | SNMP | community string |
 | DNP3 | function code |
-| **Transferred files** | MD5, SHA-256, size, and type by magic number, for request *and* response bodies, hashed as they stream so a download of any size is covered |
+| **Transferred files** | MD5, SHA-256, size, type by magic number, and a libmagic-style description (`Zip archive data`, `POSIX tar archive`), for request *and* response bodies, hashed as they stream so a download of any size is covered |
 
 Structured parsers require **complete** input before they populate a
 buffer, so splitting a request across TCP segments does not defeat a rule
@@ -448,9 +469,13 @@ rule sid:1000001; name:"sqli-union-uri"; severity:high;
 | `pcre_bt:"..."` | A regex needing lookaround, backreferences, atomic groups or possessive quantifiers, run on a bounded backtracking engine |
 | `relative` | Makes the preceding regex *resume* where the previous term ended (PCRE's `R` flag) |
 | `offset:` / `depth:` | Window from the start of the buffer: the match starts at or after `offset` and lies within `depth` bytes of it |
-| `distance:` / `within:` | **Relative** window. `distance` moves the start (and may be negative, to look back over the previous match); `within` bounds where the match must *end*. Both are measured from the end of the previous match |
+| `distance:` / `within:` | **Relative** window. `distance` moves the start (and may be negative, to look back over the previous match); `within` bounds where the match must *end*. Both are measured from the end of the previous match. Either may name a [variable](#variables) |
 | `nocase` | Case-insensitive (ASCII) |
-| `transform:<name>` | Read the buffer after a change: `percent_decode`, `url_decode`, `header_lowercase`, `strip_whitespace`, `compress_whitespace`. Must come before the terms that read the buffer |
+| `transform:<name>` | Read the buffer after a change: `percent_decode`, `url_decode`, `header_lowercase`, `strip_whitespace`, `compress_whitespace`, or its digest (`sha1`, `md5`, `sha256`). Must come before the terms that read the buffer |
+| `byte_extract:<n>,<off>,<name>[,mods]` | Read a number and remember it under a name, see [Variables](#variables) |
+| `byte_math:bytes N, offset N, oper +, rvalue N\|name, result name[,mods]` | Do arithmetic on a number read from the buffer and remember the result |
+| `base64_decode:[bytes N][,offset N][,relative]` | From here on, this rule's terms read the base64-decoded bytes |
+| `xbits:<verb>,<name>,track <ip_src\|ip_dst\|ip_pair>[,expire S]` | State shared **between connections**, see [below](#state-across-connections) |
 | `byte_test:<n>,<op>,<val>,<off>[,mods]` | Read a number out of the buffer and compare it. Operators `< > = != <= >= &`, and `!` to negate; `string,dec` reads ASCII digits, and a width of `0` reads every digit present |
 | `byte_jump:<n>,<off>[,mods]` | Read a length field and move the cursor by it |
 | `bsize:<test>` | Length of the buffer: `N`, `<N`, `>N`, `<=N`, `>=N`, or `A<>B` (exclusive at both ends, as in Suricata). Also how `urilen` translates |
@@ -555,6 +580,7 @@ rule sid:1000006; name:"traversal-after-decoding"; buffer:http.uri;
 | `header_lowercase` | Header *names* lower-cased, values untouched |
 | `strip_whitespace` | Every space, tab and line break removed |
 | `compress_whitespace` | Each run of whitespace becomes one space |
+| `sha1` / `md5` / `sha256` | The buffer's raw digest, so a rule can name content by its hash (`content:"|a9 99 3e ...|"`) |
 
 Rules are grouped by transform, and each group has its own prefilter over
 the transformed bytes, so a literal that exists only after decoding is
@@ -576,6 +602,61 @@ A rule with a packet-level condition (`flags`, `itype`, `icode`,
 `window`, `ip_proto`, `stream_size`) needs no content: the condition is
 constraint enough. Packet rules cost a scan of every packet, so it is
 done only when at least one is loaded.
+
+### Variables
+
+A rule can read a number out of a buffer, keep it, and use it later: a
+length field that says how long the next field is, a count the rest of the
+record has to agree with.
+
+```
+rule sid:1000009; name:"length-field-overrun"; content:"|AA|";
+     byte_extract:1,0,len,relative; content:"END"; distance:0; within:len;
+```
+
+`byte_extract` reads a number (binary of any width up to 8 bytes, or ASCII
+digits) and stores it under a name; `byte_math` reads one, applies `+ - * /
+<< >>` against a number or another variable, and stores the result. Names
+may then stand in for a number in `offset`, `depth`, `distance`, `within`,
+the value or offset of a `byte_test`, and `isdataat`. A rule may name up to
+eight, and they live for one evaluation of one buffer's part of a rule. A
+variable nothing set means the term that needs it did not match.
+
+Neither term moves the cursor, so a following `distance` measures from the
+last *content* match, as in Suricata.
+
+### Base64
+
+`base64_decode` makes the terms after it read decoded bytes: the bytes are
+taken from `offset` (from the cursor if `relative`) for `bytes` bytes, or to
+the end of the buffer if that is zero. Decoding is tolerant, since these
+rules are about encoded content that is rarely well-formed: characters
+outside the alphabet (whitespace included) are skipped and decoding stops at
+padding. Only literals *before* the decode can key the prefilter, because
+the prefilter sees the raw buffer.
+
+### State across connections
+
+`xbits` is state that outlives a connection and is keyed on an address:
+"this host asked an IP-check service a minute ago", so that a later,
+otherwise unremarkable connection from it means something.
+
+```
+rule sid:1000010; name:"ip-check"; buffer:tls.sni; content:"myexternalip.com"; nocase;
+     xbits:set,ipcheck,track ip_src,expire 300; noalert;
+rule sid:1000011; name:"beacon-after-ip-check"; buffer:http.uri; content:"/gate.php";
+     xbits:isset,ipcheck,track ip_src;
+```
+
+Verbs are `set`, `unset`, `toggle`, `isset` and `isnotset`; `track` is
+`ip_src`, `ip_dst` or `ip_pair`; a bit lasts `expire` seconds (30 if
+unstated). A rule's conditions are checked, and its effects applied, in the
+same stage that counts `threshold`s. It cannot live on a flow and cannot live
+in a worker (the two connections may be on different ones), and putting it
+where every alert passes is also what keeps it deterministic: under replay
+that stage processes alerts in capture-time order, so a bit set and read in
+the same second gives the same answer on every run. A rule that only sets
+state is never reported.
 
 ### Flowbits
 
@@ -599,9 +680,9 @@ skipped without scanning the buffer while the bit is unset.
 | HTTP request | `http.method` `http.uri` (percent-decoded, as Suricata normalises it) `http.host` `http.user_agent` `http.request_body` `http.request_line` `http.accept` `http.accept_enc` `http.accept_lang` `http.referer` |
 | HTTP response | `http.stat_code` `http.stat_msg` `http.response_line` `http.server` `http.location` `http.content_type` `http.response_body` |
 | HTTP either way | `http.header` (the header lines and their closing blank line, without the request or status line) `http.header_names` `http.start` `http.protocol` `http.connection` `http.content_len` `http.cookie` (on a response, `Set-Cookie`) |
-| Files | `file.data` `file.md5` `file.sha256` `file.type` |
+| Files | `file.data` `file.md5` `file.sha256` `file.type` `file.magic` |
 | DNS | `dns.query` |
-| TLS/QUIC | `tls.sni` `tls.ja3` |
+| TLS/QUIC | `tls.sni` `tls.ja3` `tls.ja3s` (the server's fingerprint) `tls.version` (`1.0`–`1.3`, as the server chose it) |
 | TLS certificate | `tls.cert_subject` `tls.cert_issuer` `tls.cert_serial` (the server's own certificate) and `tls.certs` (the raw DER of each certificate in the chain) |
 | SMB | `smb.command` `smb.filename` `smb.share` |
 | Windows auth | `ntlm.user` `ntlm.domain` `ntlm.workstation` |
@@ -652,7 +733,7 @@ python tools/suricata.py emerging-all.rules -o et-open.rules \
 argus -iface eth0 -rules et-open.rules
 ```
 
-Against ET Open's 51,074 active rules, **50,823 convert: 99.5%.**
+Against ET Open's 51,074 active rules, **50,989 convert: 99.8%.**
 
 The governing rule is **skip anything that cannot be represented
 faithfully.** A rule translated wrongly is worse than one skipped,
@@ -702,6 +783,10 @@ not, so a single translation slip cannot stop the other 50,000 loading.
 - **Packet-level rules:** `tcp-pkt`, `flags`, `itype`, `icode`, `window`,
   `ip_proto`, `stream_size`
 - **Rate control:** `threshold` and `detection_filter`
+- **Variables and decoding:** `byte_extract`, `byte_math`, `base64_decode`/`base64_data`
+- **Cross-connection state:** `xbits` and `hostbits`
+- **Server-side TLS:** `ja3s.hash`, and `tls.version:1.2` (an exact test that does not take over the buffer the following contents read)
+- **Hashes and file types:** `to_sha1`, `to_md5`, `to_sha256`, and `file.magic`
 - **The server's TLS certificate**, for TLS before 1.3
 - **Bidirectional `<>` rules**, written both ways round
 - **Idioms.** `dotprefix; content:".evil.com"; endswith` is the dominant
@@ -712,18 +797,17 @@ not, so a single translation slip cannot stop the other 50,000 loading.
 
 ### What does not
 
-What is left is 251 rules (0.5%), and each needs something ARGUS does not
+What is left is 85 rules (0.2%), and each needs something ARGUS does not
 have:
 
 | Blocker | Rules | Why |
 |---|---|---|
-| `xbits`, `hostbits` | 62 | State shared *between* connections, keyed on an address. Workers are sharded by host pair, so it would need a store all of them share |
-| `base64_decode` / `base64_data` | 56 | Decodes a slice of one buffer into another; needs a decoding stage with its own offsets |
-| `byte_extract`, `byte_math` | 32 | Named variables that later terms read; ARGUS rules have no variables |
 | `app-layer-protocol` | 12 | Almost all negated ("not TLS"), which is a claim about a flow *ever* being TLS, not about its first packet |
-| `file.magic`, `to_sha1` | 16 | A libmagic classification and a SHA-1 transform, neither of which ARGUS computes |
-| `ja3s.hash`, `tls.version` | 13 | Needs the ServerHello parsed |
-| The rest | ~60 | `asn1`, `app-layer-event`, `icmpv6.hdr`, SSH banner buffers and similar single-rule cases |
+| `flowint` | 8 | Per-flow integer counters, a different mechanism from flowbits |
+| PCRE that cannot be represented | ~10 | A letter its case transform removes (refused because the rule could never match), recursion, and the rarely used `/B` and `/G` flags |
+| `asn1` | 4 | An ASN.1 decoder and its length checks |
+| Protocols and headers ARGUS does not model | ~25 | `dcerpc`, `ftp-data` and `tcp-stream` rule types; `icmpv4.hdr`, `icmpv6.hdr`, `icmp_id`, `icmp_seq`; SSH banner buffers |
+| The rest | ~25 | Single-rule cases: no `sid`, no content, `ftpbounce`, `app-layer-event`, `ja3.string` |
 
 ### Assumptions about Suricata
 
@@ -741,6 +825,11 @@ and each could be wrong in a way the tests cannot show:
 - `byte_test` with a width of 0 on a text number reads every digit
 - `flags:!` means none of the listed flags are set
 - `stream_size:server` counts payload bytes the server has sent
+- `byte_extract` and `byte_math` do not move the cursor
+- `xbits` lasts 30 seconds when a rule gives no `expire`
+- `base64_decode` reads tolerantly whatever `mode` a rule names
+- `file.magic` uses a short table of libmagic-style descriptions, not libmagic
+- `tls.version` is the version the server chose, read from `supported_versions` under TLS 1.3
 
 The way to settle all of them is a differential test: run Suricata and
 ARGUS over the same labelled captures and compare the alerts.
@@ -1074,8 +1163,9 @@ evasion primitive.
                        │ Observations  │     Alerts     │
                   ┌────▼─────────┐     │      ┌─────────▼────────┐
                   │  behaviour   │─────┴─────►│  threshold gate  │
-                  │  aggregator  │   Alerts   │  (rate control)  │
-                  └──────────────┘            └─────────┬────────┘
+                  │  aggregator  │   Alerts   │ rate control,    │
+                  └──────────────┘            │ xbits            │
+                                              └─────────┬────────┘
                                               ┌─────────▼────────┐
    ┌───────────┐   ┌──────────┐               │  alert writer    │──► sinks
    │ reloader  │   │ metrics  │               │  allowlist,      │    text/json/eve
@@ -1092,12 +1182,13 @@ the same worker, which is what lets each worker own a connection's entire
 reassembly state with no locking.
 
 That choice has a direct consequence: `src=A,dst=B` and `src=A,dst=C`
-hash to *different* workers, so a source sweeping a subnet is spread
-across all of them. This cannot be fixed by raising a threshold: the
-evidence genuinely isn't in one place. Coarsening the shard key to source
-alone isn't available either, because TCP reassembly needs both
-directions together. That is why behavioural detection, and rate
-control, are separate stages fed from every worker.
+hash to *different* workers, so a source sweeping a subnet, or flooding
+several destinations, is spread across all of them. This cannot be fixed by
+raising a threshold: the evidence genuinely isn't in one place. Coarsening
+the shard key to source alone isn't available either, because TCP
+reassembly needs both directions together. That is why behavioural
+detection, the flood total, rate control and cross-connection state are
+separate stages fed from every worker.
 
 Several interfaces share one worker pool and one packet pool, so a
 conversation seen on two links still lands on one worker and is
@@ -1136,15 +1227,15 @@ of real enterprise traffic).
 | Ruleset | Rule load | Replay | Throughput |
 |---|---|---|---|
 | ~60 hand-written rules | instant | 1.4s | ~565k pps |
-| 50,907 ET Open rules | 3.2s | 37s | ~21k pps |
+| 51,073 ET Open rules | 3.2s | 12s | ~66k pps |
 
-A 26× slowdown for roughly 850× the rules. The scaling is sublinear: the
+Peak memory replaying that capture is about 1 GB with the full ruleset (140 MB with the small one); the rules, not the traffic, are what it holds. A 7× slowdown for roughly 850× the rules. The scaling is sublinear: the
 Aho-Corasick prefilter finds which rules are even candidates, and within
 a rule terms are checked cheapest-first (header, then flowbit state, then
 content), so a rule scoped to a port it does not match never touches the
 payload.
 
-Two costs dominated an early full-ruleset run, and both were invisible
+Three costs dominated an early full-ruleset run, and all were invisible
 until the whole set was loaded:
 
 - **Case-insensitive literals compiled to regexes.** Most of a real
@@ -1152,6 +1243,15 @@ until the whole set was loaded:
   search on the short buffers rules read. Matching them directly, and
   letting them key the prefilter, took the same replay from 150s to 37s
   with byte-identical alerts.
+- **Re-scanning the stream.** Raw-payload rules are matched against the
+  whole reassembled stream on every new segment, which is what defeats a
+  signature split across packets, and scanning it whole each time made a
+  connection's cost quadratic in its length. The scan now covers only the
+  new bytes plus enough of the old to catch a literal straddling the join;
+  the rules already found are remembered and still evaluated against the
+  whole stream. That took the same replay from 38s to 12s, and a unit test
+  checks that every way of cutting a stream into segments finds exactly
+  what scanning it whole finds.
 - **Per-flow progress for multi-buffer rules.** A `GET` request is the
   first part of thousands of rules, so one request could open thousands of
   progress records. A sorted list and then a table indexed by rule keep
@@ -1171,8 +1271,8 @@ exceptions being genuinely malformed or non-IP frames.
 ## Testing and measurement
 
 ```bash
-cargo test --release                        # 445 unit and integration tests
-python tools/test_suricata.py               # 98 translator tests
+cargo test --release                        # 480 unit and integration tests
+python tools/test_suricata.py               # 113 translator tests
 python tools/detect.py --survive corpus     # survival and noise on real captures
 python tools/detect.py                      # graded detection
 python tools/detect.py --evasion            # attacks shaped to evade
@@ -1231,17 +1331,23 @@ split_signature          SIGNATURE_MATCH        DETECTED   (one byte per segment
 out_of_order_signature   SIGNATURE_MATCH        DETECTED   (segments reversed)
 fragmented_signature     SIGNATURE_MATCH        DETECTED   (split across IP fragments)
 overlapped_pending       SIGNATURE_MATCH        DETECTED   (held segment overlapped by the one that fills the gap)
+spread_flood             PACKET_FLOOD           DETECTED   (1200pps split across 60 destinations, and so across workers)
 slow_port_scan           PORT_SCAN              DETECTED   (40 ports at 3s intervals)
 jittered_beacon          BEACONING              DETECTED   (60s beacon, 12% jitter)
 split_response           SIGNATURE_MATCH        DETECTED   (response, one byte per segment)
 
-evasion-resistance: 7/7 detected
+evasion-resistance: 8/8 detected
 ```
 
 `overlapped_pending` exists because a targeted test found a real bug: a
 segment held back for a gap, then overlapped by the data that filled it,
 was never delivered, so one out-of-order segment plus one overlap made the
 sensor stop following a stream. Its unit tests failed before the fix.
+
+`spread_flood` found a weakness in the design it was written for: the
+harness runs evasion cases with `-window 5m`, and a flood judged over the
+configured window averaged a 1,200 pps burst down to 40 pps. The flood is now
+judged over a fixed ten seconds.
 
 A `MISSED` here would be a documented limit rather than a bug.
 
@@ -1293,12 +1399,12 @@ incident.
 block, reset connections, or modify traffic.
 
 **Detection is measured against synthetic attacks.** The harness grades
-twenty-five modelled attacks and seven evasions. That is a regression floor
+twenty-five modelled attacks and eight evasions. That is a regression floor
 and a published list of what is modelled, not a real-world detection
 rate. A labelled real-world attack corpus, and a differential run against
 Suricata, remain the missing measurements.
 
-**A translated rule is a claim, not a proof.** 99.5% of ET Open loads, but
+**A translated rule is a claim, not a proof.** 99.8% of ET Open loads, but
 "loads" is not "behaves as Suricata does". See
 [Assumptions about Suricata](#assumptions-about-suricata).
 
@@ -1311,21 +1417,27 @@ file hashing likewise covers one body per direction per connection.
 Compressed bodies are hashed as sent, not decoded. SSH and RDP replies are
 encrypted, so their brute force is still counted by attempts.
 
-**Encrypted traffic is identified, not decrypted.** TLS yields SNI and
-JA3, and the server's certificate before TLS 1.3 (from 1.3 on it is
-encrypted, so certificate rules find nothing there); QUIC yields SNI and
+**Encrypted traffic is identified, not decrypted.** TLS yields SNI, JA3,
+JA3S and the server's version, and the server's certificate before TLS 1.3
+(from 1.3 on it is encrypted with keys a passive observer never has, so
+certificate rules find nothing there); QUIC yields SNI and
 JA3 from its Initial packet; ESP is counted. HTTP/2 is only visible as
 cleartext `h2c`, which is rare in practice.
 
 **Live behavioural ordering is best-effort past two seconds.** A flow's
 observation is stamped with its start and sent when it ends, so a long
 flow reaches the aggregator after the reorder window has closed and is
-handled on arrival. Replay has no such limit. `PACKET_FLOOD` is counted per
-worker, so its suppression across workers can still vary.
+handled on arrival. Replay has no such limit. This cannot be closed live
+without holding every observation until the capture ends.
 
-**Single process, single machine.** No clustering, no shared state
-between sensors, and therefore no cross-connection rule state
-(`xbits`/`hostbits`).
+**Single process, single machine.** No clustering and no shared state
+between sensors: `xbits` state is per sensor, and is lost when rules reload.
+
+**Not tested at line rate or over long runs.** Replay runs at about 66k
+packets per second with the full ruleset on one machine, which is roughly
+500 Mbit/s of typical traffic; gigabit is beyond what has been measured. Every
+table is bounded by design, but memory over hours of live traffic has not
+been observed.
 
 ---
 
@@ -1339,8 +1451,8 @@ src/
   packet.rs      the Packet value, link and IP parsing
   engine.rs      alerts, flow table, TCP reassembly, protocol parsers, anomaly detection
   rules.rs       the v2 rule language: parsing, transforms, prefilter, evaluation
-  threshold.rs   rate control: threshold and detection_filter
-  tlscert.rs     the server's TLS certificate, out of the handshake
+  threshold.rs   rate control and cross-connection state: threshold, detection_filter, xbits
+  tlscert.rs     the server's TLS certificate, version and JA3S, out of the handshake
   behavior.rs    cross-flow behavioural detection
   window.rs      sliding-window primitives shared by every detector
   intel.rs       reputation, home network, allowlist
@@ -1366,4 +1478,4 @@ blacklist.txt      example IP blacklist
 ja3-blocklist.txt  JA3 fingerprint list (ships empty, by design)
 ```
 
-Roughly 22,000 lines of Rust across eighteen source files.
+Roughly 23,000 lines of Rust across eighteen source files.
